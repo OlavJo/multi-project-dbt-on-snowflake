@@ -172,7 +172,7 @@ The boundary between structural and business logic erodes at child aggregations.
 "Strict many:1" is a claim, and an unnoticed 1:N join silently inflates every metric downstream of it. Every published aggregate therefore carries, as a blocking test:
 
 - `unique` or `dbt_utils.unique_combination_of_columns` on its declared grain
-- `dbt_utils.relationships` on each FK used for enrichment
+- `dbt_utils.relationships_where` on each FK used for enrichment
 - A row-count guard asserting the aggregate's row count equals its root table's row count (for grain-preserving aggregates)
 
 These tests provide critical guarantees, and are to be discussed at length in the detailed design document.
@@ -197,8 +197,6 @@ Per source system, consider the analytical use cases to decide:
 - Whether to emit the **child with parent attributes** (`order_items` enriched with order header fields)
 - Whether to emit **both** — common for highly normalized sources
 - Whether to snapshot the underlying entities, and at what grain
-
-
 
 ---
 
@@ -250,6 +248,8 @@ Every Tier 1 and Tier 2 project may read all of the Bronze Layer: Tier 0 and Tie
 Each Tier 1 project is owned by one (virtual) domain team (finance, marketing, operations, digital, ...) and contains all business logic for that domain. Unlike Tiers 0 and 0.5 which are combined within the single Bronze Layer dbt project, **each Tier 1 domain level project has it's own repo and dbt project.**
 
 Tier 1 projects, **by definition**, may only have sources pointing to the contracted (production) outputs of the Bronze Layer.
+
+It may also be necessary to include a 'Shared Domain' project, but this should be as a last resort if it becomes a pre-requisite for multiple Tier 2 projects. 
 
 ### 6.2 What each Tier 1 dbt project may contain
 
@@ -389,7 +389,6 @@ Going the other way, i.e. from the perspective of the Bronze Layer steward askin
 | `state:modified` does not cross the boundary | Each project runs its own state comparison against its own prod manifest | Cross-project impact is not automatic. |
 | Manual source sync | Solved by using a source definitions package | — |
 
-
 ---
 
 ## 9. Change Management
@@ -469,8 +468,6 @@ If a Tier 0 model is fully refreshed, every downstream incremental built from it
 3. Downstream projects full-refresh any incremental model depending on it, in reference-graph order (i.e. Tier 1 before Tier 2)
 4. Record the event in the build control table so that potential discrepancies can later be correlated
 
-Consider revoking `--full-refresh` in the production role's permitted arguments so that it cannot be invoked casually.
-
 ---
 
 ## 10. Write-Audit-Publish
@@ -498,12 +495,14 @@ ALTER SCHEMA bronze_layer.build SWAP WITH bronze_layer.published;
 
 Zero-copy cloning makes step 1 nearly free and preserves existing table state, so incremental models behave correctly rather than reverting to full refresh.
 
-The clone-test-swap strategy of is solid for Tiers 1 and 2 as well as the Bronze Layer. An additional benefit is that rollback is never required.
+The clone-test-swap strategy may be useful for Tiers 1 and 2 as well as the Bronze Layer. An additional benefit is that rollback is never required if the `SWAP` hasn't occurred yet.
 
-### 10.3 Two well know gotchas
+### 10.3 Well known gotchas
 
+- **Snowflake's `SWAP WITH` has issues with `VIEW` definitions.** This is a critical issue to verify, and may require a more detailed procedure. The detailed design doc needs to cover this carefully. 
 - **Grants do not follow the swap the way you expect.** `SWAP WITH` exchanges the objects between schemas. Object-level grants travel with the objects, so after a swap the newly-published objects carry whatever grants the *build* schema conferred. Apply **identical future grants to both schemas** so consumer access is correct regardless of which physical objects currently occupy the published schema. 
 - **Cloning and swapping is per-schema.** A project writing to several schemas needs each cloned and swapped, and the swaps are not atomic with respect to one another. Prefer a single published schema per project.
+ - How should test failures in the Bronze Layer be handled? One failed table from one source system should not prevent the entire analytics build. At the same time it is critical that nothing builds on top of failure. This may require the control table - certainly more detailed design is required. 
 
 #### Conclusion: 
 This build process needs careful testing, verification and documenting in the detailed design document.
