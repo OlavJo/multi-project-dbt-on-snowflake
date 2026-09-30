@@ -1,0 +1,850 @@
+# Multi-Project dbt Architecture on Snowflake
+
+## A Tiered Governance Model for Independent Teams
+
+### High Level Design: Engineering Discussion Document
+
+| | |
+|---|---|
+| **Version** | 2.4 |
+| **Date** | 2026-10-01 |
+| **Status** | **Proposed** for review |
+| **Proposed By** | Lead Data Engineer, PSM CAI |
+
+> **Revision notes (v2.3 to v2.4)** *(remove before circulation)*
+>
+> - **Terminology:** Tier 0 and Tier 0.5 units are now *modules* of the Bronze Layer project, not "projects" (Sections 1, 3, 4, 5).
+> - **Ingestion contract:** adds a CDC ordering column and makes landing-complete records the source of freshness (Section 2).
+> - **Platform constraints:** documents the dbt Projects on Snowflake constraints: no `source freshness`, one concurrent execution per project object, dependencies installed in CI (Sections 2, 8.2).
+> - **Bronze stewardship:** adds a steward team and a review gate (Section 3).
+> - **Tier 0.5:** reframed honestly as the governed shared-business-logic exception, with key stability rules (Section 5).
+> - **Tier 1:** adds the conformed key pass-through rule and a single published schema per project (Section 6).
+> - **Source package:** now generated from the Bronze manifest in CI (Section 8.2).
+> - **Versioning:** corrects the YAML example (`include`/`exclude`) and replaces the business-logic example model (Section 9.2).
+> - **Write-Audit-Publish:** rewritten around per-unit publication and "block by staleness, not status" (Section 10).
+> - **Freshness:** rewritten around propagated watermarks (Section 11).
+> - **New sections:** Run Control (Section 12) and Alternatives Considered (Section 13).
+> - **Nits:** typos, `persist_docs` naming, reference numbering, em-dashes in prose.
+
+---
+
+## 1. Executive Summary
+
+This document describes a tiered multi-project dbt architecture for Snowflake environments, using Snowflake embedded open source dbt where dbt Mesh is unavailable. (dbt Mesh is the proprietary component of dbt-Labs designed to support multi-project dbt architecture.)
+
+It balances **enterprise governance** (consistent naming, contracts, tests, access control) with **team independence** (separate CI, separate development, separate ownership, but integrated production pipelines).
+
+This multi-project architecture **classifies dbt work by Tier**, and expects each Tier to follow the rules, recommendations and guidance set for it:
+
+| Tier | Name | Purpose | Owner |
+|------|------|---------|-------|
+| n/a | Raw / Landing | Source data loaded into Snowflake | Platform team (ingestion only) |
+| 0 | Source Aggregate modules | Reconstruct source systems' logical models as ready-to-consume aggregates | Analytics (Bronze stewards) |
+| 0.5 | Core / Consolidation module | Cross-source identity resolution, conformed dimensions across sources, shared spines | Analytics (Bronze stewards) |
+| 1 | Domain projects | Business transformation: dims, facts, marts, semantic views | Analytics / Domain |
+| 2 | Cross-Domain projects | Analytics spanning two or more domains | Analytics / Business-question owner |
+
+Tiers 0 and 0.5 are modules (folders) of a single Bronze Layer dbt project. Tiers 1 and 2 are separate dbt projects, one per domain or cross-domain question.
+
+Business-driven analytics projects will tend to focus on Tier 1 (Domain projects). Rather than supporting end-to-end projects which include classical dbt sourcing and staging layers, this architecture splits Tier 0 and Tier 0.5 out as a shared layer. This provides a convenient starting point for multiple projects using common source data sets.
+
+After defining the Tiers, this document describes how dependencies between projects are managed by `source()` references to prior Tier production outputs. This approach replaces the **cross-project references** provided in dbt Mesh. It then describes how outputs are published safely (Write-Audit-Publish), how freshness propagates between Tiers, and the minimal run-control layer that ties these together.
+
+### Scope
+
+This document describes the multi-project architecture at a high level, from the perspective of the individual contributing analytics teams. It describes how we can operate multiple dbt projects without relying on dbt Mesh, including the publication and run-control mechanisms at a conceptual level.
+
+A more detailed design document will capture:
+
+- recommended setup and orchestration detail
+- role assignments and access control
+- project naming conventions
+- data testing standards
+- tagging, classification and PII handling
+- materialisation strategies
+- environment recommendations (dev, CI, prod)
+- cost attribution
+- the outcomes of the spikes listed in Section 10.7
+
+Most of this will rely on standard Snowflake recommended practice, which aligns closely with dbt-Labs.
+
+---
+
+## 2. Design Constraints
+
+- **Snowflake** as warehouse, including first class support for data lineage and cloning.
+- **Snowflake embedded open source dbt.** Projects are Snowflake objects created from a Git repository and invoked with the Snowflake command `EXECUTE DBT PROJECT`.
+- **dbt-Labs dbt Mesh / Cloud Enterprise unavailable.**
+- **Multiple independent analytics teams** with separate sprints, CI and ownership, but using a common set of enterprise data sources.
+- **Snowflake Tasks** for scheduling and cross-project coordination.
+- **Platform team owns ingestion only.** Analytics owns everything beyond the raw layer.
+
+### 2.1 Constraints of dbt Projects on Snowflake
+
+These are documented platform behaviours that shape the design:
+
+- **Only listed dbt commands are supported.** `build`, `run`, `test`, `seed`, `snapshot`, `run-operation`, `compile`, `list`, `parse`, `show` and `deps` are supported. **`dbt source freshness` is not supported**, so freshness is implemented outside dbt (Sections 11 and 12).
+- **One execution at a time per project object.** Concurrent `EXECUTE DBT PROJECT` calls against the same dbt project object are not supported, even with different selectors. Each independently scheduled publication unit is therefore deployed as its own dbt project object (Section 10.3).
+- **Caller's rights procedures.** Stored procedures that call `EXECUTE DBT PROJECT` must be caller's rights procedures.
+- **Dependencies can be installed in CI.** Running `dbt deps` in CI and deploying the project with `dbt_packages` included avoids the need for an external access integration (Section 8.2).
+- **Managed dbt runtime.** Snowflake manages the dbt runtime. Arbitrary Python plugins cannot be installed.
+
+### 2.2 The ingestion boundary
+
+The platform team is resourced to land enterprise source data in Snowflake, not to work in dbt. This is an enterprise structural reality rather than a design choice.
+
+This architecture treats the boundary as a **contract rather than a handoff**. Every raw object has a declared freshness expectation, monitored by analytics, and failures are attributable to ingestion before any dependent Tier 0 build is attempted. This is no different from a single dbt project architecture, which also treats its raw sources as a contracted boundary.
+
+We expect the platform team to provide:
+
+> - A `_loaded_at` (or equivalent) column on every landed object.
+> - For change-data-capture feeds, a **source ordering column** (sequence number, log sequence number, or source commit timestamp plus operation order). `_loaded_at` alone cannot order changes landed in the same batch, and CDC deduplication is impossible without a reliable ordering.
+> - A **landing-complete record** written to a platform-owned control table per source system and batch, including batches with zero new rows. This record is the authoritative "data as-of" signal for each source (Section 12.4). `max(_loaded_at)` is not a substitute, because a quiet source with no new rows would appear stale.
+
+---
+
+## 3. Project Tiering
+
+In this architecture, cross-project references are constrained by a fixed tiering structure. This provides an acyclicity guarantee on dependencies. The purpose is to support cross-project collaboration and to ease sharing of common datasets. Work at every Tier is expected to provide contracted (production) outputs, which are made available as sources for subsequent Tiers.
+
+```
+Raw / Landing
+  │
+  └──► Tier 0 (Source Aggregates)           ◄─ may read Raw only              ┐
+        │                                                                     ├─  Bronze Layer 
+        ├──► Tier 0.5 (Core/ Consolidation) ◄─ may read Tier 0 (+ seeds)      ┘     (Single dbt project)
+        │
+        └──► Tier 1 (Domains)               ◄─ may read Tier 0 and Tier 0.5   ┐   Silver (internal/ intermediate) 
+              │                                                               ├─    and Gold (exposure) Layer
+              └──► Tier 2 (Cross-Domain)    ◄─ may read Tier 1 marts          ┘     (Multiple dbt projects)
+```
+
+**The entire Bronze Layer (Tier 0 and Tier 0.5) is managed as a single dbt project.** Within it, each source system is a *Source Aggregate module* (a folder), and Tier 0.5 is the *Core module*. The Bronze Layer produces all available sources for the Tier 1 projects. All analytics teams contribute to it as new analytic sources are required, and it is built out conceptually as a catalogue of available analytic sources.
+
+Analytics projects will tend to focus on Tier 1. **Each domain-based Tier 1 project is a separate dbt project.** Each analytics project initially assesses the existing Bronze Layer contracted outputs as a base. Where the base is lacking, the analytics team contributes to Tier 0 or Tier 0.5. The Bronze Layer therefore provides shared analytics *internal* resources, receiving contributions from all analytics teams. Tier 1 and Tier 2 provide contracted outputs for exposure to the business.
+
+NOTE:
+
+> - Both dbt projects and the Snowflake platform capture lineage. Cross-Tier lineage (cross dbt project lineage) is captured within Snowflake itself.
+> - Tier 0 is purely about data shaping and requires no business logic.
+> - Tier 0.5 is a consolidation layer taking care of common cross-source identity and conformance.
+> - Tiers 1 and 2 capture business logic. This is where data modelling comes to the fore. These Tiers expose the Gold layer dims, facts, aggs and semantic views.
+
+### 3.1 Bronze Layer stewardship
+
+Because every analytics team contributes to the Bronze Layer, its rules are only as strong as its review gate. The no-business-logic rule for Tier 0 is the load-bearing rule of this architecture, and it erodes one reasonable-looking pull request at a time unless it is actively defended.
+
+- A named **Bronze steward team** owns the Bronze Layer repository, its CI, its release process and its run control.
+- `CODEOWNERS` assigns each source module folder, and the Core module, to stewards. Contributions from any analytics team are welcome, but merges require steward approval.
+- Stewards apply the structural join rule (4.4) and the scope-creep test (4.4.2) as review criteria.
+
+### 3.2 Tier assignment
+
+> 1. All Tier 0 and Tier 0.5 modules (the Bronze Layer) operate from a single "monorepo", using the standard dbt folder structure to separate source systems. The monorepo includes macros and tests. All outputs are contracted: column names, data types and constraints (although limited in Snowflake) are specified. Tests are performed. Documentation is pushed to Snowflake. All outputs are written to a single Bronze Snowflake database, with **one published schema per source module plus one for the Core module** (Section 10.3). The database is accessible only to analytics teams building out Tiers 1 and 2. A single dbt project and repo reinforces the perception of the Bronze Layer as an internal "catalogue" and starting point for Tier 1 analytics.
+>
+> 2. Sources with different load cadences do not require separate repos. Each source module is an independent publication unit with its own schedule (Sections 10 and 12).
+>
+> 3. If the monorepo is deemed too large, splits by source system are straightforward and yield essentially independent repos. This is because Tier 0 is purely about data shaping, with no cross-source joins. Splitting is not a necessity, and this document treats the Bronze Layer as a single dbt project and repo.
+>
+> 4. Tier 0 includes classical dbt staging, dbt snapshots and dbt seeds, as well as source system structural aggregates such as child field aggregations to parent records, or parent field attribution to child records. We borrow the term "aggregate" from Domain Driven Design, where such aggregates require no business logic. They are merely the rebuild of logical constructs from the source system's physical layer, which might be highly normalised. Where aggregation includes business logic, it must be implemented in Tier 1.
+>
+> 5. Tier 1 projects use dbt sources which are contracted production outputs of the Bronze Layer. This is a natural and very simple split of lineage, because Bronze outputs map to raw sources in a straightforward way. Tier 1 projects can immediately focus on intermediate and mart models: dims, facts, aggregates and semantic models. A Tier 1 project requiring specific data tests on its sources should contribute those tests to the Bronze Layer project.
+
+---
+
+## 4. Tier 0: Source Aggregate Modules
+
+### 4.1 Definition
+
+A Source Aggregate module reconstructs one source system's **logical data models** as denormalised, contract-enforced, tested aggregates. It is the single source of truth for operational data entering the Analytics warehouse, and **it contains no business logic**.
+
+Each Source Aggregate module is a source-named folder in the single Bronze Layer dbt project. Source Aggregate modules use these dbt resource types: sources, staging models, snapshots, seeds, macros and tests. Intermediate and mart models are explicitly excluded; they live in Tiers 1 and 2.
+
+### 4.2 What it contains
+
+| Type | dbt Folder | Purpose | Materialisation |
+|------|-------|---------|-----------------|
+| Source tables | `staging/<source>/base/` | 1:1 with source tables: cast, rename, reshape columns, deduplicate, filter soft deletes | Ephemeral, table or incremental |
+| Aggregates | `staging/<source>/` | Denormalise the source's normalised tables into logical entities (DDD aggregates without business logic); union tables split in the source | Table or incremental |
+| Snapshots | `snapshots/<source>/` | SCD2 history computed for sources lacking change capture | Snapshot (table) |
+
+**Views are not used for published objects that read raw data.** A view over raw changes the moment data lands, so it bypasses Write-Audit-Publish entirely (Section 10.5).
+
+#### Required settings and declarations
+
+- **Source freshness:** a declared freshness threshold for every raw object, recorded in run control (Section 12). dbt's `loaded_at_field` and `freshness` blocks are still declared for documentation, but `dbt source freshness` cannot be executed on Snowflake (Section 2.1).
+- **Contracts:** `contract: enforced: true` on all published aggregates.
+- **Column documentation:** `persist_docs` enabled for relations and columns, so documentation is persisted to Snowflake. Every column is described and typed. Documentation describes all tests undertaken, so that downstream projects can make informed and consistent assumptions.
+- **CDC deduplication:** uses the source ordering column (Section 2.2), not `_loaded_at` alone.
+
+### 4.3 What it does NOT contain
+
+- Any join or filter driven by a **business decision**.
+- Any **cross-source-system** join. Cross-source joins for identity and conformance belong in Tier 0.5; all others belong in Tier 1.
+- Any derived metric or KPI resting on a business rule.
+- Any model whose grain changes based on a business filter.
+
+### 4.4 The Structural Join Rule
+
+Joins are permitted in an aggregate **if and only if** they are:
+
+- Driven by the source's own **foreign key relationship**.
+- Grain-preserving for the aggregate root, or a strict many:1 enrichment.
+- Present **regardless of what any analyst wants to do** with the data. This is usually (but not always) evidenced by the foreign key being useful for only one particular join, for example order items joined to an order.
+
+**Allowed:** `order_items LEFT JOIN orders ON order_items.order_id = orders.order_id` (FK-driven enrichment).
+
+**Not allowed:** `order_items JOIN orders WHERE orders.status = 'completed'` (business filter).
+
+#### 4.4.1 Carve-out: source-semantic filters
+
+Three filters are *structural* rather than business-driven and are explicitly permitted:
+
+1. **Soft deletes.** Excluding rows the source system itself considers deleted (`is_deleted`, `deleted_at is not null`). A soft-deleted row is not data the source believes in.
+2. **Deduplication of change-data-capture rows.** Selecting the current version per key, using the source ordering column.
+3. **Tenant or instance scoping**, where the source is multi-tenant and only one tenant is in scope for the warehouse. For example, a source audit table includes records of various kinds, of which only one kind is relevant for analytics.
+
+Non-structural filters (based on a business rule) belong in Tier 1.
+
+#### 4.4.2 The scope-creep test
+
+The boundary between structural and business logic erodes at child aggregations. `order_item_count` is structural; `net_revenue` is not. The distinguishing test:
+
+> **If two competent analysts could compute it differently, it belongs in Tier 1.**
+
+`order_item_count` has one reasonable definition. `net_revenue` requires decisions about discounts, returns, tax and cancellations. Hence it is business logic, however obvious it looks in one source system.
+
+#### 4.4.3 Fan-out must be tested, not asserted
+
+"Strict many:1" is a claim, and an unnoticed 1:N join silently inflates every metric downstream of it. Every published aggregate therefore carries, as a blocking (`error` severity) test:
+
+- `unique` or `dbt_utils.unique_combination_of_columns` on its declared grain.
+- `dbt_utils.relationships_where` on each FK used for enrichment.
+- A row-count guard asserting the aggregate's row count equals its root table's row count (for grain-preserving aggregates).
+
+These tests provide critical guarantees and are discussed at length in the detailed design document.
+
+### 4.5 Incremental aggregates: the joined-model trap
+
+A denormalised aggregate materialised incrementally on its root key **will silently miss updates to joined child tables** if the incremental filter only looks at the root. For example, on the `orders` aggregate with `unique_key: order_id` and `merge`, filtered on the order's own timestamp, a change to an order *item* is never noticed.
+
+The required pattern is to collect changed keys from **every** contributing table, then rebuild those roots in full. Such design patterns belong in the detailed design document.
+
+Snowflake dynamic tables handle incremental refresh across joins natively and would remove this trap. However, they do not fit the clone-build-swap publication model in Section 10, and dbt contract support for them must be confirmed. They are listed as an optional spike (Section 10.7) rather than a recommendation.
+
+### 4.6 Snapshots: capture at base grain
+
+Snapshotting the *denormalised aggregate* is tempting. However, any change to any joined-in column spawns a new SCD2 row, so history becomes high-churn and expensive.
+
+**Rule:** snapshots capture `base/` models at their natural grain. Denormalisation happens downstream of the snapshot, not upstream of it.
+
+### 4.7 Aggregate design decisions
+
+Per source system, consider the analytical use cases to decide:
+
+- Whether to emit the **parent with child aggregations** (`orders` with item count, total quantity).
+- Whether to emit the **child with parent attributes** (`order_items` enriched with order header fields).
+- Whether to emit **both**, which is common for highly normalised sources.
+- Whether to snapshot the underlying entities, and at what grain.
+
+---
+
+## 5. Tier 0.5: Core / Consolidation
+
+### 5.1 Why it exists
+
+Prior to any domain business logic, there are shared concerns requiring special handling:
+
+1. **Conformed dimensions and spines:** cross-domain `dim_date` and fiscal calendar, currency and geography lookups held in seed datasets.
+2. **Cross-source identity resolution:** a customer in the ERP and the same customer in the CRM. Tier 0 forbids cross-source joins, and Tier 1 is domain-scoped, so neither can own this.
+
+Identity resolution is honestly **business logic**: matching rules are judgements, and two competent analysts could write them differently. It fails the scope-creep test in 4.4.2. Tier 0.5 exists because this logic must be shared and must have exactly one owner. It is the **one governed exception** where shared business logic lives below Tier 1, and it is governed accordingly.
+
+Tier 0.5 is likely to remain small, with critical but niche datasets.
+
+### 5.2 What it contains
+
+| Layer | Purpose | Materialisation |
+|-------|---------|-----------------|
+| Conformed dimensions | `dim_core__date`, `dim_core__currency`, `dim_core__fiscal_period` | Table |
+| Crosswalks | `xref_core__customer` mapping source-system keys to a durable `customer_key` | Table (snapshot-backed) |
+| Reference seeds | Curated lists, mappings, hierarchies under version control | Seed |
+
+### 5.3 Governance
+
+Tier 0.5 is the **only** tier permitted to join across source systems, and that privilege is narrowly scoped:
+
+- It may join across sources **for the purpose of identity resolution or conformance only**, not to answer a business question.
+- Every crosswalk publishes its **match rate and unmatched-key counts as tested metrics**, with an `error`-severity floor. An entity-resolution rule that quietly stops matching is worse than one that fails.
+- **Durable keys are never reassigned.** Once a `customer_key` is issued, it continues to identify the same real-world entity when matching rules change. Merges and splits are recorded explicitly (for example, a superseded-key mapping), never by silently re-pointing a key. Key stability is harder than match rate and is specified in the detailed design.
+- Matching rules are documented in prose next to the model, and changes to them require steward review (Section 9.3).
+- It is contracted and versioned exactly as Tier 0 outputs are.
+- Tier 0.5 shares the monorepo with the Tier 0 modules. It is a special case within the Bronze Layer, with its own folder and its own publication unit.
+
+### 5.4 Why not simply relax Tier 0's rule?
+
+Because the no-cross-source-join rule is the clearest, most enforceable statement in this architecture, and a carve-out inside Tier 0 could be used to justify a genuine business join. Isolating the exception in a separate Tier with its own review gate keeps Tier 0's rule absolute.
+
+### 5.5 Readable by everyone in Analytics
+
+Every Tier 1 and Tier 2 project may read all of the Bronze Layer: Tier 0 and Tier 0.5. This is the one shared-data route for analytics teams, managed by access to the single Bronze database.
+
+**The wider business has no access to the Bronze Layer.** The business consumes from Tier 1 and Tier 2.
+
+---
+
+## 6. Tier 1: Domain Projects
+
+### 6.1 Definition
+
+Each Tier 1 project is owned by one (virtual) domain team (finance, marketing, operations, digital, ...) and contains all business logic for that domain. Unlike Tiers 0 and 0.5, which are combined within the single Bronze Layer dbt project, **each Tier 1 domain has its own repo and dbt project.**
+
+Tier 1 projects, **by definition**, may only have sources pointing to the contracted (production) outputs of the Bronze Layer.
+
+It may also be necessary to include a "Shared Domain" project. This should be a last resort, used only if it becomes a prerequisite for multiple Tier 2 projects.
+
+### 6.2 What each Tier 1 dbt project may contain
+
+| dbt Folder | Purpose | Published? | Medallion |
+|-------|---------|------------|-----------|
+| `intermediate/` | Business-logic transformations, joins, filters, aggregations | No: intermediate = internal | Silver |
+| `marts/` | Dims and facts: contracted, documented, tested outputs | Yes | Gold |
+| `semantic/` | Metric definitions | Yes | Gold |
+| `presentation/` | Dashboard-optimised denormalisations | Yes | Gold |
+| `features/` | ML feature tables | Yes | Gold |
+
+### 6.3 Published versus internal
+
+Only `marts/`, `semantic/`, `presentation/` and `features/` are consumable outside the project (Gold Layer). This is enforced by schema separation and grants, not by convention:
+
+- All published folders build into **one published schema per project**, distinguished by naming prefix (`dim_`, `fct_`, `sem_`, `pres_`, `feat_`). A single published schema is what allows atomic publication (Section 10.3).
+- Internal models (Silver) build into a separate internal schema that no other role can read.
+
+A downstream project that needs an intermediate model has found a modelling gap. The answer is to promote the model to a mart, not to grant access.
+
+### 6.4 Contracts
+
+All published models in Tier 1 enforce contracts, as in the Bronze Layer. Contracts are declared in the model's YAML alongside full column specifications:
+
+```yaml
+models:
+  - name: fct_revenue
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: revenue_date
+        data_type: date
+        constraints:
+          - type: not_null
+      - name: recognised_amount
+        data_type: number(38,2)
+      ...
+  ...
+```
+
+### 6.5 One semantic layer
+
+- Metrics are defined once, in the domain that owns the concept.
+- Cross-domain metrics are defined in the Tier 2 project that owns the question, and may not redefine a Tier 1 metric.
+
+### 6.6 Conformed keys pass through unaltered
+
+Conformed dimensions only conform if domains do not re-derive them. Finance and digital may each publish their own `dim_customer`, but both **must carry the Tier 0.5 durable key (`customer_key`) unaltered** and must not apply their own identity matching. This is what makes Tier 2 joins across domain marts valid.
+
+---
+
+## 7. Tier 2: Cross-Domain Projects
+
+A Tier 2 project is warranted when:
+
+- The business questions **span two or more Tier 1 domains**.
+- It supports an **ongoing dashboard or application**, not an ad hoc investigation. Ad hoc means merely writing queries against existing marts, even if the query is run regularly. Tier 2 is only for materialising cross-domain marts. Materialising transforms is the purpose of dbt.
+- It is complex enough to warrant tests, contracts and documentation.
+- It belongs naturally to neither source domain.
+
+**Example:** "Impact of digital journey on financial performance" consumes the finance mart and the digital mart and belongs in neither. It gets its own project.
+
+**NOTE:** Governance is **identical** to Tier 1: owned, contracted, tested, documented.
+
+Tier 2 depends only on Tier 1 outputs. This may mean analysts working on a Tier 2 project first contribute to a Tier 1 project, even if only a skeleton.
+
+---
+
+## 8. Inter-Project Reference Mechanism
+
+The critical consequence of Tiering is a clean dependency structure, whereby projects reference each other's production outputs through `source()`. This section reviews the mechanism and its trade-offs. It does not relitigate the community's naming of the pattern as the *source-hack*. This approach, *together with Tiering* and *Snowflake's lineage and cloning capabilities*, mitigates the risks of a free-for-all source-referencing approach.
+
+### 8.1 The mechanism
+
+A downstream (higher Tier) project declares an upstream project's published relations as sources, resolved per environment:
+
+```yaml
+sources:
+  - name: bronze_erp
+    database: "{{ env_var('DBT_BRONZE_DB') }}"
+    schema: erp
+    tables:
+      - name: ent_erp__orders
+        description: "One row per order..."
+        columns:
+            - name: order_id
+              description: "Unique identifier..."
+            - name: channel_id
+              description: ...
+            ...
+      - name: ent_erp__order_items
+        description: ...
+        ...
+```
+
+> **Never hard-code a production database name in `sources.yml`.** Resolution is by `env_var` or by target, always. This simplifies dbt project usage in dev and test environments.
+
+### 8.2 Distribute source definitions as a generated package
+
+To eliminate manual copying of `sources.yml` into multiple projects, source definitions are distributed as a common "analytics sources" dbt package. The package contains only source definitions, plus shared macros and generic tests (including the `upstream_fresh` test in Section 12.7), but no models.
+
+**The package is generated, not hand-maintained.** Bronze Layer CI generates the source definitions from the Bronze manifest (published relations, column names, types and descriptions) and releases a new package version automatically on each Bronze release. This removes source-sync drift as a failure mode.
+
+Consumers pin a version in `packages.yml`:
+
+```yaml
+packages:
+  - git: "https://git.internal/bronze-layer-dbt-sources.git"
+    revision: "1.4.0"
+```
+
+Consumer CI runs `dbt deps` and deploys the project with `dbt_packages` included. No external access integration is required in Snowflake (Section 2.1).
+
+This ensures that common documentation travels with the package and is available in each project's lineage. The package includes all available sources. There are several ways to manage unused source definitions, although they have no impact on execution. Recommendations belong to the detailed design document.
+
+**SUMMARY:**
+
+> - All Tier 1 dbt projects consume the Bronze Layer (Tier 0 and Tier 0.5) through the generated sources package.
+> - Tier 2 projects use the appropriate Tier 1 outputs as sources.
+
+### 8.3 Why not import packages containing models?
+
+A package containing *models* is a different proposition and remains out of scope. This is an explicit restriction that ensures projects are coupled only through their contracted outputs.
+
+| Risk | Severity |
+|------|----------|
+| Accidental rebuild of upstream models (`dbt build --select +model`) | **Potential production incident** |
+| Schema resolution defaults to the consumer's target schema | Wrong schema, wrong role |
+| Per-environment `+schema` / `+database` overrides in every consumer | Operational surface area |
+
+Snowflake's own documented approach to cross-project dependencies (copying the referenced project into the consuming project's root) is a package-with-models approach and is excluded for the same reasons.
+
+### 8.4 Lineage: downstream impact analysis is the direction that matters
+
+Broken lineage at the Tier 0 to Tier 1 border is trivial from the Tier 1 user's perspective, because the upstream DAG is very simple given the Bronze Layer restrictions.
+
+Going the other way, from the perspective of the Bronze steward asking **"What breaks if I change this column?"**, Snowflake answers natively, without any manifest stitching:
+
+- **`SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES`**: which objects reference a given object, including across databases. Catches view and table dependencies declaratively.
+- **`SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`**: which queries, roles and users touched a given object, with **column-level granularity**. Catches BI tools and ad hoc consumers that no dbt manifest knows about.
+
+**Requirements:**
+
+- A standing "who consumes this?" query, available to every steward, run as a mandatory step before any breaking change. This is strictly better than manifest stitching for impact analysis, because it sees consumers entirely outside dbt.
+- Use dbt model versions to manage changes (Section 9.2).
+
+**NOTE:** Changes to the Bronze Layer, being concerned with data shaping and devoid of business logic, are likely to be rare.
+
+### 8.5 Known limitations and mitigations
+
+| Limitation | Mitigation | Residual risk |
+|-----------|------------|---------------|
+| No compile-time validation of upstream schema | Contracts in the producing project; generated, version-pinned source package; downstream CI builds against the pinned version; all breaking changes managed through dbt versioning | A producer can still break a consumer between version bumps. (The Bronze Layer is mostly stable and simply structured, so breaking changes should be rare.) |
+| Broken lineage at project boundary (upstream direction) | Source package carries column docs; `persist_docs` puts descriptions in Snowflake | The visual DAG is still severed, even though upstream lineage is simple |
+| Broken lineage (**downstream** direction) | Snowflake `OBJECT_DEPENDENCIES` and `ACCESS_HISTORY` | Requires a query, not a click |
+| `state:modified` does not cross the boundary | Each project runs its own state comparison against its own prod manifest | Cross-project impact is not automatic |
+| Manual source sync | Source package generated by Bronze CI | None |
+| `dbt source freshness` unavailable on Snowflake | Freshness from landing-complete records and propagated watermarks (Sections 11 and 12) | Relies on the platform team writing landing-complete records reliably |
+
+---
+
+## 9. Change Management
+
+### 9.1 What contracts actually do
+
+**A contract asserts that a model's output matches its own YAML specification.** It does not protect consumers in a downstream dbt project from changes made in the upstream project, because the upstream model specification, including the contract, can itself be changed.
+
+Specifically, rename a column in both the SQL and the YAML of the upstream project and the build succeeds. Downstream `source()` references break at runtime.
+
+**Awareness of this possibility is key, so all upstream changes require analysis and dbt versioning.**
+
+What contracts *do* provide:
+
+- An upstream model cannot silently change shape relative to its declared specification. A mis-typed column or dropped field fails the producer's build.
+- With state comparison against the producer's own prod manifest, dbt **flags breaking contract changes** in the producer's CI. It tells the producing team they made a breaking change. It cannot tell whether any consumer minds, and the upstream change can proceed by bumping a version.
+- For the Bronze to Tier 1 boundary, a machine-readable schema that travels to consumers via the generated source package. The package can include tests validating schema and properties. Recommendations are expected in the detailed design document.
+
+### 9.2 Model versions and deprecation dates
+
+Protection for consumers comes from versioning, not enforcement. Bronze Layer changes, rare as they are, must strictly use versions.
+
+dbt's `versions` and `deprecation_date` are the critical mechanism, and they work well with a `source()`-based architecture. In this example, v2 renames `total_amount` to `order_total_amount`:
+
+```yaml
+models:
+  - name: ent_erp__orders
+    latest_version: 2
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: order_id
+        data_type: varchar
+      - name: order_date
+        data_type: date
+      - name: order_total_amount
+        data_type: number(38,2)
+    versions:
+      - v: 1
+        deprecation_date: 2027-03-31
+        columns:
+          - include: all
+            exclude: [order_total_amount]
+          - name: total_amount          # pre-rename name
+            data_type: number(38,2)
+      - v: 2
+```
+
+A version inherits all top-level columns by default, so v1 must explicitly exclude the renamed column and declare its old name. Without the `include`/`exclude`, v1 would carry both columns and its contract would fail.
+
+Because versioned models materialise to **distinct physical relations** (`ent_erp__orders_v1`, `ent_erp__orders_v2`), both exist in the warehouse simultaneously. That is exactly the migration window a `source()`-based consumer needs:
+
+1. The producer ships `v2` alongside `v1` and sets `v1`'s `deprecation_date`.
+2. Bronze CI regenerates the source package and bumps its minor version; the new relation appears in consumers' source definitions.
+3. Each consumer migrates its `source()` reference on its own schedule, within the window.
+4. After the deprecation date, the producer drops `v1`.
+
+### 9.3 Change management matrix
+
+| Change | Process |
+|--------|---------|
+| Tier 0 additive (new column, new aggregate) | Deploy. Source package minor version bumped by CI. Consumers unaffected |
+| Tier 0 **breaking** (rename, drop, retype) | Run the Snowflake impact query. New model version with `deprecation_date`. Notify named consumers. Drop old version after the date |
+| Tier 0.5 crosswalk rule change | **Always treated as breaking**, even when the schema is unchanged, because match-rate changes alter downstream numbers silently. Requires steward review and consumer notification. Durable keys are never reassigned (Section 5.3) |
+| Tier 1 additive in a published mart | Deploy. Bump package minor version |
+| Tier 1 **breaking** in a published mart | As Tier 0 breaking. Tier 2 consumers are enumerable. May also require investigating metadata in `exposures` |
+| New source system | Add a Source Aggregate module (a folder in the Bronze Layer project), with its own publication unit and run-control entries. Available to all consumers once grants apply |
+| **Full refresh of a Tier 0 incremental** | Not a routine operation; requires coordination (Section 9.4) |
+
+### 9.4 Full-refresh coordination
+
+If a Tier 0 model is fully refreshed, every downstream incremental built from it may now rest on shifted history: rows that changed, or disappeared, outside any downstream watermark.
+
+**Policy:** a full refresh of any published Bronze Layer model is a **coordinated event**, not a routine `--full-refresh` flag:
+
+1. Announce to consumers identified by the Snowflake impact query, with a stated window.
+2. Full-refresh the upstream model (through the normal publication procedure, so it is still gated by tests).
+3. Downstream projects full-refresh any incremental model depending on it, in reference-graph order (Tier 1 before Tier 2).
+4. Record a `FULL_REFRESH` event in the run-control log (Section 12.2), so that discrepancies can later be correlated.
+
+---
+
+## 10. Write-Audit-Publish
+
+### 10.1 Two requirements in tension
+
+With a plain `dbt build`, tests run after models are replaced. By the time a test fails, published tables have already changed and downstream projects may already have been triggered. Tests observe the incident rather than prevent it.
+
+Gating publication on tests fixes this. But a single gate over the whole Bronze Layer means one failing source blocks every analytics team. We need both:
+
+- **(a)** Nothing ever builds on data that failed its tests.
+- **(b)** A failure blocks only what depends on it.
+
+### 10.2 Principle: failures block by staleness, not by status
+
+A failed build never replaces published data. The last good version keeps serving, and the failure shows up downstream as **staleness**: the unit's watermark stops advancing.
+
+Downstream units are never gated on an upstream *failure*. They are gated on upstream *freshness* against their own declared tolerance (Sections 11 and 12). This satisfies both requirements:
+
+- Failed data is never published, so nothing can read it (a).
+- Unrelated units are unaffected (b).
+- Dependent units either proceed on last-good data within tolerance, or skip.
+
+### 10.3 Publication units
+
+A **publication unit** is the smallest set of objects published atomically. Each unit has exactly one consumer-visible (published) schema and one build schema, and optionally one internal schema.
+
+| Tier | Unit | Example schemas |
+|---|---|---|
+| Tier 0 | One per source system | `bronze.erp`, `bronze.erp__build` |
+| Tier 0.5 | One unit | `bronze.core`, `bronze.core__build` |
+| Tier 1 / 2 | One per project | `finance.published`, `finance.published__build`, plus internal `finance.internal`, `finance.internal__build` |
+
+Source systems work as units because Tier 0 forbids cross-source joins. Each source module is therefore an independent subgraph that can be published without reference to any other. Within a unit, publication is all-or-nothing, so consumers always see a consistent snapshot of a source. Across units, publication is independent, and each unit keeps its own schedule.
+
+Each unit is deployed as **its own dbt project object** (from the same repo, for Bronze modules), because Snowflake does not support concurrent execution of a single project object (Section 2.1).
+
+### 10.4 Publish procedure
+
+One generic, caller's rights procedure, parameterised by unit and driven by run-control configuration (Section 12), performs:
+
+```sql
+-- 0. Gate: are upstream units within this unit's freshness tolerance,
+--    and has anything upstream published since this unit last published?
+--    If not, log SKIPPED and stop.
+
+-- 1. Clone last good state (zero-copy; preserves incremental and snapshot state)
+CREATE OR REPLACE SCHEMA bronze.erp__build CLONE bronze.erp;
+
+-- 2. Build and test into the clone
+EXECUTE DBT PROJECT bronze.ops.bronze_erp
+  ARGS = 'build --select erp --vars {publish_unit: erp}';
+
+-- 3. On success only: atomic publish, then restore container grants
+ALTER SCHEMA bronze.erp__build SWAP WITH bronze.erp;
+GRANT USAGE ON SCHEMA bronze.erp TO DATABASE ROLE bronze_reader;
+
+-- 4. Log PUBLISHED with watermark, or FAILED (Section 12)
+```
+
+If step 2 fails, nothing published has changed. There is no rollback, because there is nothing to roll back. The build schema is discarded and re-cloned at the next run's step 1.
+
+For units with an internal schema, both schemas are cloned and built, then swapped **internal first, published second**. Only the published schema is consumer-visible, so atomicity is only required there.
+
+**Schema redirection.** A custom `generate_schema_name` sends only the models of the unit being published (`var('publish_unit')`) into `__build` schemas. All other references resolve to published schemas. This is how the Core module reads last-good Tier 0 outputs through `ref()` while keeping in-project lineage. Sketch (to be validated, and extended for dev and CI targets):
+
+```jinja
+{% macro generate_schema_name(custom_schema_name, node) -%}
+  {%- set base = (custom_schema_name or target.schema) | trim -%}
+  {%- if target.name == 'prod' and base == var('publish_unit', none) -%}
+    {{ base }}__build
+  {%- else -%}
+    {{ base }}
+  {%- endif -%}
+{%- endmacro %}
+```
+
+**Schema-relative references in views (subject to spike S1).** dbt renders fully qualified names, so a view in `bronze.erp__build` referencing a sibling table would still point at `bronze.erp__build` after the swap, reading the stale objects now living under that name. If Snowflake resolves an unqualified identifier inside a view relative to the view's own schema, then rendering **same-schema references from views** as bare identifiers makes views swap-safe. References to other schemas stay fully qualified; they follow the swap by name and are unaffected. Tables, incrementals and tests stay fully qualified, because their SQL resolves against the session, not against an object's own schema. Sketch:
+
+```jinja
+{% macro ref() %}
+  {%- set rel = builtins.ref(*varargs, **kwargs) -%}
+  {%- if model.config.materialized == 'view'
+        and rel.database == this.database
+        and rel.schema == this.schema -%}
+    {%- do return(rel.include(database=false, schema=false)) -%}
+  {%- endif -%}
+  {%- do return(rel) -%}
+{% endmacro %}
+```
+
+If spike S1 fails, views are not used for same-unit references inside published schemas, and that logic is made ephemeral instead.
+
+### 10.5 Rules
+
+1. **Anything published that reads raw data is materialised** (table, incremental or snapshot). A view over raw changes the moment data lands, so it cannot be gated. This rule holds regardless of the outcome of spike S1.
+2. **Views in published schemas** may reference other units' objects (fully qualified), and same-unit objects only through bare identifiers once spike S1 confirms schema-relative resolution. Snowflake semantic views are included in this rule and in spike S1.
+3. **Test severity carries meaning.** `error` blocks publication of the unit; `warn` publishes and is logged. Only tests that evidence wrong data are `error`: grain, FK relationships, row-count guards, contracts and crosswalk match-rate floors.
+4. **Retries are idempotent.** Every run starts from a clone of the last good state, so a failed run can simply be re-run. This holds for incrementals and snapshots alike.
+5. **Consumer roles are never granted on build schemas.** Grants on child objects travel with a schema clone; grants on the schema itself do not. The procedure therefore re-applies schema USAGE after every swap. Identical future grants are defined on both published and build schemas.
+6. **One unit, one dbt project object.**
+
+### 10.6 Failure behaviour
+
+| Failure | Published result | Downstream |
+|---|---|---|
+| `erp` test fails | `bronze.erp` stays at last good | `crm` unaffected. `core` and ERP-dependent Tier 1 projects proceed on last-good ERP if within tolerance, otherwise skip. Their watermarks inherit ERP's older watermark |
+| `core` crosswalk match rate below floor | Previous crosswalk keeps serving | All consumers stay on the last accepted identity mapping |
+| `finance` build fails | Finance marts stay at last good | Tier 2 gated by finance freshness |
+| Raw ERP batch does not land | No new landing-complete record; raw ERP watermark stops advancing | Staleness attributable to ingestion in run control (Section 12.4) |
+
+### 10.7 Spikes required before the detailed design
+
+| # | Spike | Question |
+|---|---|---|
+| S1 | View-relative resolution | Create view `s1.v` as `select * from t`, swap `s1` with `s2`, check which `t` the view reads. Also confirm `CREATE VIEW` accepts the bare identifier at creation, and repeat for semantic views |
+| S2 | Swap and grants | Measure the privilege gap between `SWAP` and `GRANT USAGE`; confirm whether future grants move with the schema object |
+| S3 | Failure signalling | Does `EXECUTE DBT PROJECT` raise, or return a status, on test failure inside a procedure? |
+| S4 | Snapshots | Confirm snapshot correctness under clone-build-discard-retry |
+| S5 | Clone cost | Clone time and storage behaviour for the largest incremental models |
+| S6 | Macros across targets | `generate_schema_name` and `ref` overrides across dev, CI and prod |
+| S7 | Dynamic tables (optional) | Whether Tier 0 aggregates as dynamic tables can coexist with Write-Audit-Publish and contracts |
+
+---
+
+## 11. Freshness and Staleness Contracts
+
+### 11.1 The silent-wrongness problem in Tier 2
+
+Suppose Tier 2 is triggered after all upstream Tier 1 tasks have completed. Finance completed this morning; digital last succeeded three days ago. Tier 2 builds successfully, publishes a cross-domain fact mixing fresh and stale data, and **no test anywhere fails.** The dashboard is wrong with no warning.
+
+Completion is not freshness. Every cross-tier dependency needs a freshness assertion, not just a completion signal.
+
+### 11.2 Propagated watermarks
+
+Every publication unit carries a **watermark**: the time its data is current as of.
+
+- A raw source's watermark is the time of its latest landing-complete record (Section 2.2).
+- A published unit's watermark is the **minimum of its upstream watermarks**, read at gate time.
+
+Staleness therefore propagates automatically through the Tiers. In the example above, the Tier 2 unit's watermark is digital's three-day-old watermark, not finance's fresh one.
+
+Each unit declares a **tolerance per upstream dependency** (Section 12.3). Before building, the unit's gate checks every upstream watermark against its tolerance, and skips if any is exceeded. Skipping leaves the last good version published and the watermark unchanged, so the staleness remains visible.
+
+Tier 1 and Tier 2 consumers can display the unit's watermark as **"data as of"** on dashboards, turning silent wrongness into a visible label.
+
+### 11.3 Source freshness at the raw boundary
+
+`dbt source freshness` is not available in dbt Projects on Snowflake (Section 2.1). Raw freshness is instead derived from the platform team's landing-complete records, which are represented in run control as raw units owned by the platform team (Section 12.4). A stale raw unit is therefore visible, with an unambiguous owner, before any dependent Tier 0 build is attempted.
+
+dbt `freshness` blocks remain declared on sources for documentation. `dbt_utils.recency` tests on sources may be used as an additional in-dbt check where useful.
+
+---
+
+## 12. Run Control
+
+### 12.1 Design principle: record facts, not state
+
+Run control coordinates publication, freshness and full-refresh events across all units. Its main simplicity lever is that it **records facts rather than maintaining state**: rows are appended, never updated, and all current state is derived by views. The complete design is:
+
+- one append-only event log
+- two small configuration tables, maintained under version control
+- a view of platform landing records
+- two status views
+- the single publish procedure (Section 10.4)
+- one scheduled task per unit
+
+Run control operates at **unit granularity only**. Per-model results stay in dbt's own logs and Snowflake's telemetry event table, and are not duplicated.
+
+Run control lives in its own database or schema (for example `analytics_ops.control`), owned by the Bronze steward role.
+
+### 12.2 The event log
+
+```sql
+create table analytics_ops.control.publish_log (
+  event_ts    timestamp_ltz default current_timestamp(),
+  unit        varchar,        -- 'bronze.erp', 'tier1.finance'
+  event_type  varchar,        -- STARTED | PUBLISHED | FAILED | SKIPPED | FULL_REFRESH
+  watermark   timestamp_ltz,  -- data as-of, set on PUBLISHED
+  run_id      varchar,
+  detail      variant
+);
+```
+
+The log is append-only: no updates, no `MERGE` contention, and a complete audit trail by construction. Writers are restricted to:
+
+- the publish procedure (STARTED, PUBLISHED, FAILED, SKIPPED)
+- a small steward procedure for FULL_REFRESH events
+
+### 12.3 Configuration
+
+Static configuration is maintained in a small ops repository and deployed as seeds or tables. Changes go through pull request review.
+
+```sql
+-- One row per publication unit, including raw units owned by the platform team
+units (unit, tier, owner, dbt_project_object, schedule)
+
+-- One row per dependency edge; this is the cross-project dependency graph
+unit_dependencies (unit, upstream_unit, max_age_hours)
+```
+
+The dependency graph is declared, never inferred at runtime.
+
+### 12.4 Raw units and the landing boundary
+
+The platform team keeps writing its own landing-complete table (Section 2.2); analytics is granted read access only. A view presents each landing-complete record as a PUBLISHED event for the corresponding raw unit (for example `raw.erp`). Raw units therefore appear in status and gating exactly like any other unit, with the platform team as owner. The platform team needs no write access into analytics run control.
+
+### 12.5 Status views
+
+Illustrative sketch:
+
+```sql
+create or replace view analytics_ops.control.unit_status as
+with events as (
+  select unit, event_type, event_ts, watermark
+  from analytics_ops.control.publish_log
+  union all
+  select 'raw.' || lower(source_system), 'PUBLISHED', completed_at, completed_at
+  from analytics_ops.control.v_landing_complete      -- view over the platform table
+)
+select
+  unit,
+  max(iff(event_type = 'PUBLISHED', event_ts, null))                 as published_at,
+  max_by(watermark, iff(event_type = 'PUBLISHED', event_ts, null))   as watermark,
+  max_by(event_type, event_ts)                                       as last_event,
+  max(event_ts)                                                      as last_event_at
+from events
+group by unit;
+```
+
+A second view, `unit_freshness`, joins `unit_status` to `unit_dependencies` and flags every edge whose upstream watermark exceeds its tolerance. This is the operational dashboard for stewards and domain owners.
+
+### 12.6 Gating and scheduling
+
+For v1, each unit runs as a **scheduled task with a gate**, not as part of an event-driven cross-project task graph. The gate proceeds only when both conditions hold:
+
+1. Every upstream watermark is within its tolerance.
+2. At least one upstream has published since this unit last published. Otherwise there is nothing new to build.
+
+If either fails, the procedure logs SKIPPED and exits. On success, the new watermark is the minimum of the upstream watermarks read at gate time.
+
+This avoids cross-database task graphs and a dispatcher entirely. If latency later matters, a stream on `publish_log` feeding one dispatcher triggered task can replace the schedules, and the log design does not change.
+
+### 12.7 Freshness visible in dbt (optional)
+
+`unit_status` is included as a source in the generated source package, together with a generic `upstream_fresh(unit, max_age)` test. Tier 1 and Tier 2 developers then see upstream freshness in their own dbt output, without needing to query run control directly.
+
+---
+
+## 13. Alternatives Considered
+
+| Alternative | Assessment |
+|---|---|
+| **dbt Mesh / dbt Cloud Enterprise** | Provides native cross-project `ref`. Unfunded; excluded by constraint |
+| **Single monorepo for all tiers, using dbt groups and `access: private / protected / public`** | Compile-time boundary enforcement, full lineage and working `state:modified` across all teams. Rejected because independent teams on separate sprints would share one CI pipeline, one dbt version and one deployment, and one broken merge would block everyone. Adopted *within* the Bronze Layer, where shared stewardship is the intent |
+| **dbt-loom** (open-source cross-project `ref` from upstream manifests) | Requires a Python plugin. Snowflake's managed dbt runtime does not allow plugin installation, so it is unavailable without running dbt outside Snowflake |
+| **Snowflake's native cross-project dependency** (copy the referenced project into the consumer's root) | A package-with-models approach; rejected for the reasons in Section 8.3 |
+| **Database-level blue/green swap**, with `ref` rendering schema-relative names | A known community pattern that fixes view binding. Rejected in favour of schema-level units: per-source isolation would require a database per unit, adding DDL and grants, and the relative-reference side effects are the same. Revisit if spike S1 fails |
+| **Per-table `ALTER TABLE ... SWAP`** | Not atomic across a unit, so consumers could see inconsistent tables within one source |
+| **Blue/green schemas behind pointer views** | Reintroduces the view-binding problem |
+| **Dynamic tables for Tier 0 aggregates** | Would remove the joined-model trap (4.5), but conflicts with clone-build-swap. Optional spike S7 |
+
+---
+
+## 14. References
+
+### 14.1 dbt-Labs documentation
+
+- [dbt-Labs Best practices](https://docs.getdbt.com/best-practices?version=2)
+- [dbt: How we structure our projects](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview)
+- [dbt: Staging](https://docs.getdbt.com/best-practices/how-we-structure/2-staging)
+- [dbt: Snapshots](https://docs.getdbt.com/docs/build/snapshots)
+- [dbt: Data contracts](https://docs.getdbt.com/docs/collaborate/govern/model-contracts)
+- [dbt: Model versions](https://docs.getdbt.com/docs/collaborate/govern/model-versions)
+- [dbt: Model access](https://docs.getdbt.com/docs/collaborate/govern/model-access)
+- [dbt: Incremental models](https://docs.getdbt.com/docs/build/incremental-models)
+- [dbt: Packages](https://docs.getdbt.com/docs/build/packages)
+- [dbt: persist_docs](https://docs.getdbt.com/reference/resource-configs/persist_docs)
+- [dbt: Mesh project dependencies](https://docs.getdbt.com/docs/mesh/govern/project-dependencies)
+
+### 14.2 Snowflake documentation
+
+- [dbt Projects on Snowflake](https://docs.snowflake.com/en/user-guide/data-engineering/dbt-projects-on-snowflake)
+- [dbt Projects on Snowflake: supported commands](https://docs.snowflake.com/user-guide/data-engineering/dbt-projects-on-snowflake-supported-commands)
+- [dbt Projects on Snowflake: dependencies](https://docs.snowflake.com/user-guide/data-engineering/dbt-projects-on-snowflake-dependencies)
+- [dbt Projects on Snowflake: limitations](https://docs.snowflake.com/en/user-guide/data-engineering/dbt-projects-on-snowflake-limitations)
+- [Best practices for dbt projects on Snowflake](https://docs.snowflake.com/en/developer-guide/dt/dbt-best-practices)
+- [Task graphs and dependencies](https://docs.snowflake.com/en/user-guide/tasks-graphs)
+- [Triggered tasks](https://docs.snowflake.com/en/user-guide/tasks-triggered)
+- [Streams](https://docs.snowflake.com/en/user-guide/streams-intro)
+- [Cloning](https://docs.snowflake.com/en/user-guide/object-clone) and [SWAP WITH](https://docs.snowflake.com/en/sql-reference/sql/alter-schema)
+- [Object name resolution](https://docs.snowflake.com/en/sql-reference/name-resolution)
+- [OBJECT_DEPENDENCIES](https://docs.snowflake.com/en/sql-reference/account-usage/object_dependencies) and [ACCESS_HISTORY](https://docs.snowflake.com/en/sql-reference/account-usage/access_history)
+- [Tag-based masking policies](https://docs.snowflake.com/en/user-guide/tag-based-masking-policies)
+- [Resource monitors](https://docs.snowflake.com/en/user-guide/resource-monitors)
+
+### 14.3 Tooling and community
+
+- [dbt-project-evaluator](https://dbt-labs.github.io/dbt-project-evaluator/latest/)
+- [dbt-utils](https://github.com/dbt-labs/dbt-utils)
+- [dbt-core discussion #5244: cross-project lineage](https://github.com/dbt-labs/dbt-core/discussions/5244)
+- [Performing a blue/green deploy of your dbt project on Snowflake](https://discourse.getdbt.com/t/performing-a-blue-green-deploy-of-your-dbt-project-on-snowflake/1349)
+
+---
+---
