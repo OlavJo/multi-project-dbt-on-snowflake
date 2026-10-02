@@ -2,25 +2,21 @@
 
 ## The Shared Foundation for Multi-Project dbt on Snowflake
 
-### Design Document for Bronze Stewards and Platform Engineering
+### Design Document for Bronze Stewards and Data Engineering
 
 | | |
 |---|---|
-| **Version** | 1.0 |
+| **Version** | 1.1 |
 | **Date** | 2026-10-01 |
 | **Status** | **Proposed** for review |
 | **Proposed By** | Lead Data Engineer, PSM CAI |
-| **Companion document** | *Multi-Project dbt on Snowflake: Architecture Overview* v3.0 (referred to below as the **Overview**) |
-
-> **Revision note** *(remove before circulation)*
->
-> Derived from HLD v2.4, Sections 2 to 5 and 10 to 12, reorganised around the Bronze Layer as a platform product. New in this document: the guarantee-to-mechanism map (Section 1.2), the Snowflake feature map (Section 2), the schema layout (Section 5.2), and an open issue on consistent reads across publication units (Section 10.9, spike S10).
+| **Companion document** | *Multi-Project dbt on Snowflake: Architecture Overview* v1.1 (referred to below as the **Overview**) |
 
 ---
 
 ## 1. Purpose and Scope
 
-### 1.1 The Bronze Layer as a platform product
+### 1.1 The Bronze Layer as analytics infrastructure
 
 The Bronze Layer (Tier 0 Source Aggregate modules and the Tier 0.5 Core module) is the foundation every analytics project builds on. Its transformations are deliberately trivial: shaping, never business logic. Yet it is where the hardest properties of the system meet:
 
@@ -29,7 +25,7 @@ The Bronze Layer (Tier 0 Source Aggregate modules and the Tier 0.5 Core module) 
 - **Everything inherits its guarantees.** If Bronze provides them, the Tiers above get them almost for free. If it does not, no care above can recover them.
 - **Its failures have the largest blast radius.**
 
-The Bronze Layer is therefore designed and operated as **infrastructure**: a platform product with a steward team, service levels, a release process and an operational control plane. The objective of this document is a design that is right first time and does not need major overhaul as sources and teams are added.
+The Bronze Layer is therefore designed and operated as **infrastructure**: with a steward team (analytics support data engineers), service levels, a release process and an operational control plane. This design can easily accomodate new sources and new analytics teams.
 
 ### 1.2 Guarantees and how they are met
 
@@ -45,7 +41,7 @@ The Overview (Section 3.2) promises consumers the following. Each is delivered b
 | G6 | **Shaping only** | Structural join rule, scope-creep test, steward review gate | 5.3, 6.5 |
 | G7 | **Stable keys** | Durable-key rules in the Core module | 9.3 |
 
-**Service levels** (per-source freshness targets, publication windows, time to restore) are to be agreed with the platform team and consumers and recorded in run-control configuration (Section 12.3). This document defines the mechanisms that measure them, not the targets.
+**Service levels** (per-source freshness targets, publication windows, time to restore) are to be agreed with the platform team (responsible for ingestion into Snowflake) and consumers and recorded in run-control configuration (Section 12.3). This document defines the mechanisms that measure them, not the targets.
 
 ### 1.3 Scope
 
@@ -78,13 +74,13 @@ The architecture uses embedded dbt deliberately, and replaces missing dbt-Labs c
 
 ---
 
-## 3. Platform Constraints and Prerequisites
+## 3. Snowflake Constraints and Prerequisites
 
 ### 3.1 Constraints of dbt Projects on Snowflake
 
-These documented platform behaviours shape the design:
+These documented Snowflake behaviours shape the design:
 
-- **Only listed dbt commands are supported.** `build`, `run`, `test`, `seed`, `snapshot`, `run-operation`, `compile`, `list`, `parse`, `show`, `deps`, `clean`, `retry` and `source freshness` are supported through `EXECUTE DBT PROJECT`. **`source freshness`, `retry` and `clean` require a live-version project object** (Section 3.2). The newer dbt `freshness` command is not listed, so this design uses `dbt source freshness`.
+- **Only listed dbt commands are supported.** `build`, `run`, `test`, `seed`, `snapshot`, `run-operation`, `compile`, `list`, `parse`, `show`, `deps`, `clean`, `retry` and `source freshness` are supported through `EXECUTE DBT PROJECT`. **`source freshness`, `retry` and `clean` require a live-version project object** (Section 3.2). The newer `dbt freshness` command is not listed, so this design uses `dbt source freshness`.
 - **Concurrent executions use distinct artifact paths.** Several executions of one project object may run at once. With writeback enabled, each must use distinct, non-overlapping `--target-path` and `--log-path` directories inside the project. Bronze units therefore share one project object (Section 10.3).
 - **Caller's rights procedures.** Stored procedures that call `EXECUTE DBT PROJECT` must be caller's rights procedures.
 - **User-managed warehouses.** Tasks that execute `EXECUTE DBT PROJECT` must specify a user-managed warehouse; serverless tasks cannot be used.
@@ -108,7 +104,7 @@ Consequences for this design:
 
 - **Version history lives in Git only.** Numbered object versions and `DEFAULT_VERSION` are removed. Rolling back code means redeploying an earlier commit from CI.
 - **Concurrent runs need separate artifact paths** (Section 3.1).
-- **Opting in.** An account opts in by enabling the 2026_06 bundle (check with `SYSTEM$BEHAVIOR_CHANGE_BUNDLE_STATUS('2026_06')`), or by asking the Snowflake account representative to enable the separate single-live-version feature. New or replaced project objects are then live-version objects; existing objects migrate with `SYSTEM$MIGRATE_DBT_PROJECT`. Once the bundle is fully released, remaining versioned objects are migrated automatically, so this is the platform's direction of travel regardless.
+- **Opting in.** An account opts in by enabling the 2026_06 bundle (check with `SYSTEM$BEHAVIOR_CHANGE_BUNDLE_STATUS('2026_06')`), or by asking the Snowflake account representative to enable the separate single-live-version feature. New or replaced project objects are then live-version objects; existing objects migrate with `SYSTEM$MIGRATE_DBT_PROJECT`. Once the bundle is fully released, remaining versioned objects are migrated automatically, so this is Snowflake's direction of travel regardless.
 
 ---
 
@@ -159,7 +155,7 @@ Frozen inputs live **inside** each published schema, alongside the objects that 
 
 The no-business-logic rule for Tier 0 is the load-bearing rule of this architecture. It erodes one reasonable-looking pull request at a time unless it is actively defended.
 
-- A named **steward team** owns the repository, CI, releases, run control and on-call for the Bronze Layer.
+- A named **steward team (of data engineers)** owns the repository, CI, releases, run control and on-call for the Bronze Layer.
 - `CODEOWNERS` assigns each source module, and the Core module, to stewards. Contributions from any analytics team are welcome; merges require steward approval.
 - Stewards review against the structural join rule (Section 6.5), the scope-creep test (Section 6.5.2) and test placement (Section 8).
 
@@ -175,7 +171,7 @@ If the repository becomes too large, splitting by source system is straightforwa
 
 A Source Aggregate module reconstructs one source system's **logical data models** as denormalised, contract-enforced, tested aggregates. It is the single source of truth for operational data entering the analytics warehouse, and **it contains no business logic**.
 
-Each module is a source-named folder in the Bronze project. Modules use sources, staging models, snapshots, seeds, macros and tests. Intermediate and mart models are excluded; they live in Tiers 1 and 2.
+Each module is a source-named folder in the Bronze project. **Modules use sources, staging models, snapshots, seeds, macros and tests.** Intermediate and mart models are excluded: they live in Tiers 1 and 2.
 
 ### 6.2 What a module contains, and how it is materialised
 
@@ -354,7 +350,7 @@ The Core module is expected to remain small, with critical but niche datasets.
 |-------|---------|-----------------|
 | Conformed dimensions | `dim_core__date`, `dim_core__currency`, `dim_core__fiscal_period` | Table |
 | Crosswalks | `xref_core__customer` mapping source-system keys to a durable `customer_key` | Table (snapshot-backed) |
-| Reference seeds | Curated lists, mappings, hierarchies under version control | Seed |
+| Reference seeds | Curated lists, mappings, hierarchies under version control | Seed (Table) |
 
 ### 9.3 Governance
 
@@ -377,12 +373,12 @@ The no-cross-source-join rule is the clearest, most enforceable statement in thi
 
 ### 10.1 Two requirements in tension
 
-With a plain `dbt build`, tests run after models are replaced. By the time a test fails, published tables have already changed. Tests observe the incident rather than prevent it.
+With a plain `dbt build`, tests run after models are replaced. By the time a test fails, published tables have already changed. **Tests observe the incident rather than prevent it.**
 
 Gating publication on tests fixes this. But a single gate over the whole Bronze Layer means one failing source blocks every analytics team. Both are required:
 
-- **(a)** Nothing ever builds on data that failed its tests.
-- **(b)** A failure blocks only what depends on it.
+> **(a)** Nothing ever builds on data that failed its tests.  
+> **(b)** A failure blocks only what depends on it.  
 
 ### 10.2 Principle: failures block by staleness, not by status
 
@@ -641,14 +637,16 @@ A second view, `unit_freshness`, joins `unit_status` to `unit_dependencies` and 
 
 ### 12.6 Gating and scheduling
 
-For v1, each unit runs as a **scheduled task with a gate**, not as part of an event-driven cross-project task graph. The gate proceeds only when both conditions hold:
+As an initial approach, each unit runs as a **scheduled task with a gate**, not as part of an event-driven cross-project task graph. The gate proceeds only when both conditions hold:
 
 1. Every upstream watermark is within its tolerance. For Source Aggregate units, this includes `dbt source freshness` on the unit's raw sources, where an `error_after` breach counts as a failed tolerance.
 2. At least one upstream has published since this unit last published. Otherwise there is nothing new to build.
 
 If either condition fails, the procedure logs SKIPPED and exits. On success, the new watermark is the minimum of the upstream watermarks read at gate time (for Source Aggregate units, the freeze timestamp).
 
-This avoids cross-database task graphs and a dispatcher entirely. If latency later matters, a stream on `publish_log` feeding one dispatcher triggered task can replace the schedules, and the log design does not change.
+This avoids cross-database task graphs and a dispatcher entirely. 
+
+If latency later matters, the intial approach can be enhanced by using a stream on `publish_log` feeding one dispatcher triggered task can replace the schedules, and the log design does not change.
 
 ### 12.7 Freshness visible in dbt
 
