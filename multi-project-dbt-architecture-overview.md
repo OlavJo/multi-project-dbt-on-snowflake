@@ -6,15 +6,11 @@
 
 | | |
 |---|---|
-| **Version** | 3.0 |
+| **Version** | 1.0 |
 | **Date** | 2026-10-01 |
 | **Status** | **Proposed** for review |
 | **Proposed By** | Lead Data Engineer, PSM CAI |
 | **Companion document** | *Bronze Layer Design* v1.0 (referred to below as **BLD**) |
-
-> **Revision note** *(remove before circulation)*
->
-> This document and the Bronze Layer Design together supersede HLD v2.4. Everything an analytics team needs to build, consume and contribute is here. The design of the Bronze Layer itself, including publication, freshness and run control, is in the BLD. No design decisions changed in the split; the new material is the Snowflake feature map (Section 10) and the Bronze guarantees (Section 3.2).
 
 ---
 
@@ -29,12 +25,12 @@ dbt work is classified into Tiers:
 | Tier | Name | Purpose | Owner |
 |------|------|---------|-------|
 | n/a | Raw / Landing | Source data loaded into Snowflake | Platform team (ingestion only) |
-| 0 | Source Aggregate modules | Reconstruct source systems' logical models as ready-to-consume aggregates, with no business logic | Bronze stewards |
-| 0.5 | Core / Consolidation module | Cross-source identity resolution, conformed dimensions, shared spines | Bronze stewards |
-| 1 | Domain projects | Business transformation: dims, facts, marts, semantic views | Domain teams |
-| 2 | Cross-Domain projects | Analytics spanning two or more domains | Business-question owners |
+| 0 | Source Aggregate modules | Reconstruct source systems' logical models as ready-to-consume aggregates, with no business logic | Bronze stewards (Analytics Team) |
+| 0.5 | Core / Consolidation module | Cross-source identity resolution, conformed dimensions, shared spines | Bronze stewards (Analytics Team) |
+| 1 | Domain projects | Business transformation: dims, facts, marts, semantic views | Domain teams (Analytics Team) |
+| 2 | Cross-Domain projects | Analytics spanning two or more domains | Business-question owners (Analytics Team) |
 
-Tiers 0 and 0.5 together form the **Bronze Layer**: a single dbt project, operated as a **platform product** by a steward team and shared by every analytics team. Tiers 1 and 2 are ordinary dbt projects, one per domain or cross-domain question, owned by the teams that build them.
+Tiers 0 and 0.5 together form the **Bronze Layer**: a single dbt project and git repository, operated as **analytics infrastructure** by a steward team (of analytics support data engineers) and shared by every analytics team. Tiers 1 and 2 are ordinary dbt projects, one per domain or cross-domain question (with it's own git repository), owned by the teams that build them.
 
 Projects connect only through each other's **published, contracted outputs**, referenced with `source()`. This replaces dbt Mesh's cross-project `ref()`. Changes are managed with dbt model versions, and every published output carries a **watermark** stating how current its data is.
 
@@ -47,7 +43,7 @@ The Bronze Layer's transformations are deliberately trivial, yet it is where the
 - every downstream project inherits its guarantees
 - its failures have the largest blast radius
 
-Getting it right first time, without later overhaul, is the single most important outcome of this design. Its design therefore has its own document, the BLD, written for Bronze stewards and platform engineers.
+Getting it right first time, without later overhaul, is the single most important outcome of this design. Its design therefore has its own document, the BLD, written for Bronze stewards and data engineers.
 
 This document is for everyone building Tier 1 and Tier 2 projects. It covers the Tiers, how to consume and contribute to the Bronze Layer, change management, and what publication and freshness mean for your project. Within a Tier 1 or Tier 2 project, standard dbt-Labs practice applies and is not restated here.
 
@@ -68,7 +64,7 @@ A detailed design document will cover: role assignments and access control, nami
 - **Snowflake Tasks** for scheduling and cross-project coordination.
 - **Platform team owns ingestion only.** Analytics owns everything beyond the raw layer.
 
-### 2.1 Platform prerequisite: live-version dbt project objects
+### 2.1 Snowflake prerequisite: live-version dbt project objects
 
 The architecture assumes **live-version** dbt project objects (Snowflake 2026_06 behaviour change bundle). A live-version object keeps dbt's run artifacts between executions. This enables:
 
@@ -102,7 +98,7 @@ Raw / Landing
 - **Tiers 1 and 2 hold all business logic.** This is where data modelling comes to the fore: dims, facts, aggregates and semantic views.
 - **Lineage across project boundaries** is captured by Snowflake itself (Section 10).
 
-### 3.1 The Bronze Layer as a platform product
+### 3.1 The Bronze Layer as analytics infrastructure
 
 The Bronze Layer is one dbt project in one repository, organised as one folder (module) per source system plus the Core module. It writes to a single Bronze database with one published schema per module. The wider business has no access to it; only analytics teams building Tiers 1 and 2 can read it.
 
@@ -117,7 +113,7 @@ A named **steward team** owns the Bronze Layer's repository, CI, releases and op
 | G1 | **Gated** | Nothing is published unless it passed its tests. A failed build leaves the previous good version in place |
 | G2 | **Consistent** | All published outputs of one source reflect a single point in time; a join between two of them never sees half a batch |
 | G3 | **Dated** | Every published unit carries a watermark ("data as of"). Staleness is visible, never silent |
-| G4 | **Contracted and documented** | Column names and types are enforced; descriptions are persisted into Snowflake and travel in the source package |
+| G4 | **Contracted and documented** | Column names and types are enforced; descriptions are persisted into Snowflake and travel in the source package, a dedicated dbt package enabling Bronze Layer referencing |
 | G5 | **Versioned** | Breaking changes arrive as a new model version, alongside the old one, with a stated deprecation date |
 | G6 | **Shaping only** | No business logic, except the governed identity resolution and conformance in Tier 0.5 |
 | G7 | **Stable keys** | Durable keys issued by Tier 0.5 (for example `customer_key`) are never reassigned |
@@ -137,6 +133,8 @@ Tier 1 projects, **by definition**, may only have sources pointing to the publis
 A "Shared Domain" project may be needed, but only as a last resort, if it becomes a prerequisite for multiple Tier 2 projects.
 
 ### 4.2 What a Tier 1 project may contain
+
+In addition to `sources/` provided through the Bronze Layer:
 
 | dbt Folder | Purpose | Published? | Medallion |
 |-------|---------|------------|-----------|
@@ -227,11 +225,11 @@ sources:
 
 > **Never hard-code a production database name in source definitions.** Resolution is by `env_var` or by target, always. This lets the same project run against development, CI and production.
 
-The dbt community calls this pattern the *source-hack*. Combined with the Tier structure and Snowflake's lineage and cloning, it gives most of what dbt Mesh offers (Section 10). The remaining gaps are listed in Section 6.4.
+The dbt community calls this pattern the *source-hack*. Combined with the Tier structure and Snowflake's lineage and cloning, it gives most of what dbt Mesh offers (Section 10). Note that cross-project references in dbt Mesh resolve in a similar way, but the dbt-Labs platform provides a far greater level of integration across multiple projects. The remaining gaps are listed in Section 6.4.
 
 ### 6.2 The Bronze sources package
 
-Tier 1 projects do not write Bronze source definitions by hand. Bronze CI **generates** them from the Bronze manifest (relations, columns, types, descriptions) and releases them as a versioned dbt package with every Bronze release. The package also carries shared macros and generic tests, including an `upstream_fresh` test (Section 9.2). It contains no models.
+Tier 1 projects do not write Bronze source definitions by hand. Bronze CI **generates** them from the Bronze manifest (relations, columns, types, descriptions) and releases them as a versioned dbt package with every Bronze release. The package also carries shared macros and generic tests, including an `upstream_fresh` test (Section 9.2). **It contains no models.**
 
 Consumers pin a version:
 
@@ -247,7 +245,7 @@ Tier 2 projects declare the Tier 1 outputs they read in the same way. A generate
 
 ### 6.3 Why not import packages containing models?
 
-A package containing *models* would couple projects through code rather than through contracted outputs. This is explicitly out of scope:
+A package containing *models* would couple projects through code rather than through contracted outputs. **This is explicitly out of scope**:
 
 | Risk | Severity |
 |------|----------|
@@ -255,7 +253,7 @@ A package containing *models* would couple projects through code rather than thr
 | Schema resolution defaults to the consumer's target schema | Wrong schema, wrong role |
 | Per-environment `+schema` / `+database` overrides in every consumer | Operational surface area |
 
-Snowflake's documented approach to cross-project dependencies (copying the referenced project into the consuming project) is a package-with-models approach and is excluded for the same reasons.
+Snowflake has documented an approach to cross-project dependencies using a copy of the referenced project in the consuming project. This is a package-with-models approach and is rejected for the above reasons.
 
 ### 6.4 Known limitations and mitigations
 
@@ -276,7 +274,7 @@ Contribute when your project needs a source system, table, aggregate or source t
 
 ### 7.2 How
 
-- Open a pull request against the Bronze repository. `CODEOWNERS` routes it to the stewards for the affected source module, and a steward approval is required to merge.
+- Open a pull request against the Bronze repository. `CODEOWNERS` routes it to the Bronze stewards/ data engineers for the affected source module, and a steward approval is required to merge.
 - A new source system becomes a new module (folder), with its own publication unit and run-control entries. Stewards set these up with you.
 - Base models are published only when a Tier 1 project consumes them, so say which outputs you need.
 
@@ -420,7 +418,7 @@ Embedded dbt on Snowflake was chosen deliberately, so this architecture uses Sno
 | PII protection | (none built in) | Tag-based masking policies | Documented |
 | Cost attribution | (none built in) | Warehouse per Tier or unit, query and object tags, resource monitors | Design |
 
-One Mesh capability has no Snowflake equivalent: **compile-time validation of references across projects**. It is mitigated by contracts, the generated source package and versioning (Section 6.4).
+One dbt Mesh capability has no Snowflake equivalent: **compile-time validation of references across projects**. It is mitigated by contracts, the generated source package and versioning (Section 6.4).
 
 ---
 
