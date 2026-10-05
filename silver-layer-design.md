@@ -2,15 +2,15 @@
 
 ## The Shared Foundation for Multi-Project dbt on Snowflake
 
-### Design Document for Silver Stewards and Data Engineering
+### Design Document for Data Engineering and Silver Stewards
 
 | | |
 |---|---|
-| **Version** | 1.2 |
-| **Date** | 2026-10-02 |
+| **Version** | 1.3 |
+| **Date** | 2026-10-05 |
 | **Status** | **Proposed** for review |
-| **Proposed By** | Lead Data Engineer, PSM CAI |
-| **Companion document** | *Multi-Project dbt on Snowflake: Architecture Overview* v1.2 (referred to below as the **Overview**) |
+| **Proposed By** | Olav Jordens, Lead Data Engineer, PSM CAI |
+| **Companion document** | *Multi-Project dbt on Snowflake: Architecture Overview for Analytics Teams* v1.3 (referred to below as the **Overview**) |
 
 ---
 
@@ -18,22 +18,22 @@
 
 ### 1.1 The Silver Layer as analytics infrastructure
 
-The Silver Layer (Tier 0 Source Entity modules and the Tier 0.5 Core module) is the foundation every analytics project builds on. In medallion terms, raw landed data is Bronze (owned by the platform team), the Silver Layer is Silver, and the published outputs of Tier 1 and Tier 2 projects are Gold.
+The Silver Layer (Tier 0 Source Entity modules and the Tier 0.5 Core module) is the foundation every analytics project builds on. In medallion terms, raw landed data is Bronze (owned by the platform team), the published outputs of the Silver Layer is Silver, and the published outputs of Tier 1 and Tier 2 projects are Gold.
 
 The Silver Layer's transformations are deliberately simple: shaping, never business logic. Yet it is where the hardest properties of the system meet:
 
 - **Untrusted data enters.** Freshness, ordering, landing completeness and source defects are all handled once, here.
-- **Many teams share one artefact.** Tier 1 and Tier 2 projects each have one owner; the Silver Layer has contributions from all of them.
+- **Many teams share one artefact.** Tier 1 and Tier 2 projects each have one owner; the Silver Layer may have contributions from all of them.
 - **Everything inherits its guarantees.** If Silver provides them, the Tiers above get them almost for free. If it does not, no care above can recover them.
 - **Its failures have the largest blast radius.**
 
-The Silver Layer is therefore designed and operated as **infrastructure**: with a steward team (analytics support data engineers), service levels, a release process and an operational control plane. It is designed for **safe change rather than permanence**: contracts, model versions from v1, independent publication units and a phased scope (Section 5.5) let it evolve without disrupting consumers, and accommodate new sources and new analytics teams.
+The Silver Layer is therefore designed and operated as **infrastructure**: with a steward team (of analytics support data engineers), service levels, a release process and an operational control plane. It is designed for **safe change for consumers**: contracts, model versions from v1, independent publication units and a phased scope (Section 5.5). These features let it evolve without disrupting consumers, and accommodate new sources and new analytics teams.
 
 ### 1.2 Guarantees and how they are met
 
 The Overview (Section 3.2) promises consumers the following. Each is delivered by a specific mechanism here:
 
-| # | Guarantee | Mechanism | Section |
+|  | Data Engineering Guarantee | Mechanism | Section |
 |---|---|---|---|
 | G1 | **Gated**: nothing published failed its tests | Clone, freeze, build and test in isolation; explicit success check; atomic `SWAP` on success only | 10 |
 | G2 | **Consistent**: one point in time per source | Frozen inputs: all raw tables of a source cloned at one timestamp | 7 |
@@ -115,7 +115,7 @@ Consequences for this design:
 - **Version history lives in Git only.** Numbered object versions and `DEFAULT_VERSION` are removed. Rolling back code means redeploying an earlier commit from CI.
 - **Concurrent runs need separate artifact paths** (Section 3.1).
 - **Partial parsing needs constant inputs per path.** Changing `--vars`, `profiles.yml`, `dbt_project.yml`, packages, the dbt version or `generate_x_name`/builtin overrides forces a full re-parse. Each unit always runs with the same `--vars` in its own target path, so its partial-parse state stays valid.
-- **Opting in.** An account opts in by enabling the 2026_06 bundle (check with `SYSTEM$BEHAVIOR_CHANGE_BUNDLE_STATUS('2026_06')`), or by asking the Snowflake account representative to enable the separate single-live-version feature. New or replaced project objects are then live-version objects; existing objects migrate with `SYSTEM$MIGRATE_DBT_PROJECT`. Once the bundle is fully released, remaining versioned objects are migrated automatically, so this is Snowflake's direction of travel regardless.
+- **Opting in.** An account opts in by enabling the 2026_06 bundle (check with `SYSTEM$BEHAVIOR_CHANGE_BUNDLE_STATUS('2026_06')`), or by asking the Snowflake account representative to enable the separate single-live-version feature. New or replaced project objects are then live-version objects; existing objects migrate with `SYSTEM$MIGRATE_DBT_PROJECT`. Once the bundle is fully released, remaining versioned objects are migrated automatically, **so this is Snowflake's direction of travel regardless**.
 
 **Canonical state.** A unit's production run compiles its own models into `<unit>__build` schemas (Section 10.4), so its manifest is the wrong state for CI: `--defer` would resolve unselected models to build schemas, which hold the previous version after a swap and a half-built one during the next run. In addition, `SYSTEM$DBT_GET_LAST_SUCCESSFUL_RUN_TARGET` takes a project object, not a target path, so with several units on one object it returns whichever unit finished last. Therefore:
 
@@ -173,7 +173,7 @@ The Silver Layer is a single dbt project in a single repository ("monorepo"):
 - Shared macros and generic tests.
 - One live-version dbt project object in Snowflake, executed per unit (Section 10.3).
 
-A single project gives compile-time `ref()` between Core and the Source Entity modules, one CI pipeline, one set of conventions, and full in-project lineage. It reinforces the Silver Layer as one catalogue of analysis-ready sources.
+A single project gives compile-time `ref()` between Core and the Source Entity modules, one CI pipeline, one set of conventions, and full in-project lineage. It reinforces the Silver Layer as the catalogue of analysis-ready sources.
 
 ### 5.2 Database and schema layout
 
@@ -192,7 +192,7 @@ Frozen inputs live **inside** each published schema, alongside the objects that 
 The no-business-logic rule for Tier 0 is the load-bearing rule of this architecture. It erodes one reasonable-looking pull request at a time unless it is actively defended.
 
 - A named **steward team (of data engineers)** owns the repository, CI, releases, run control and on-call for the Silver Layer.
-- `CODEOWNERS` assigns each source module, and the Core module, to stewards. Contributions from any analytics team are welcome; merges require steward approval, within the agreed review service level (Section 1.2).
+- `CODEOWNERS` assigns each source module, and the Core module, to stewards. Contributions from any analytics team are welcome. Merges require steward approval, within the agreed review service level (Section 1.2).
 - Stewards review against the structural join rule (Section 6.5), the scope-creep test (Section 6.5.2), test placement (Section 8) and classification (Section 6.3).
 - Generated base models (Section 6.2) and the rule of two for entity models (Section 6.8) keep the volume of contributions, and therefore the review load, low.
 
@@ -225,7 +225,7 @@ Each module is a source-named folder set in the Silver project. **Modules use so
 | Base models | `staging/<source>/` | 1:1 with source tables: cast, rename, reshape columns, filter soft deletes. **Generated for every table** when a source is onboarded, then refined by stewards | View over the frozen input |
 | CDC current state | `staging/<source>/` | Deduplicate change-data-capture rows to one current row per key, using the source ordering column | Incremental table |
 | CDC history | `history/<source>/` | One row per key per version, with `valid_from` and `valid_to` from the source's own change ordering (G8) | Incremental table (permanent) |
-| Entity models (`ent_*`) | `entities/<source>/` | Denormalise normalised source tables into logical entities; union tables split in the source | Incremental table (or table) |
+| Entity models (`ent_*`) | `entities/<source>/` | Denormalise normalised source tables into logical entities; union of tables split in the source | Incremental table (or table) |
 | Snapshots | `snapshots/<source>/` | SCD2 history for sources lacking change capture (G8) | Snapshot (permanent table) |
 | Helpers | `staging/<source>/` | Internal logic shared by the above | Ephemeral |
 
@@ -344,7 +344,7 @@ The Core module has no frozen inputs: it reads published Source Entity outputs a
 ### 7.4 Costs and risks
 
 - **Query-time shaping.** Base views re-execute their casts and renames on every consumer query. This is cheap for light 1:1 shaping; heavier work stays in incremental tables.
-- **Retained storage.** A clone shares micro-partitions with raw at creation. A replaced clone's unique micro-partitions (those raw has since rewritten) are retained for Time Travel. Transient clones avoid Fail-safe; a short retention period on Silver schemas should contain the rest (spike S9).
+- **Retained storage.** A clone shares micro-partitions with raw at creation. A replaced clone's unique micro-partitions (those raw has since rewritten) are retained for time travel. Transient clones avoid Fail-safe; a short retention period on Silver schemas should contain the rest (spike S9).
 - **Clone time.** Cloning is metadata-only but not instantaneous for tables with many micro-partitions (spike S5).
 - **Governance policies.** Masking and row access policies, and tag associations, are documented to carry over to table clones, so frozen inputs inherit raw's protection. Materialised outputs do not inherit it; Section 6.3 covers them.
 - **Replication.** If Silver is replicated for disaster recovery, frozen-input clones replicate logically only when raw is in the same replication or failover group; otherwise they replicate as physical copies (Section 10.10).
@@ -459,7 +459,7 @@ Downstream units are never gated on an upstream *failure*. They are gated on ups
 
 ### 10.3 Publication units
 
-A **publication unit** is the smallest set of objects published atomically. Each unit has exactly one schema, holding everything the unit builds, and one build schema.
+A **publication unit** is the smallest set of objects published atomically. Each unit has exactly one schema holding everything the unit builds, and one build schema.
 
 | Tier | Unit | Example schemas |
 |---|---|---|
@@ -590,18 +590,18 @@ The watermark recorded at gate time understates freshness in this case (the safe
 - **Upstream schema clone at gate time.** The downstream unit's procedure zero-copy clones each upstream published **schema** it reads into a private input schema, and the downstream build reads those clones. A schema clone carries views, and swap-safe views (Section 10.5) rebind to the cloned frozen inputs beside them, so base views are covered. The clone runs under the steward-owned service role, since consumers have no access to frozen inputs. Depends on spike S1.
 - **Publication windows.** Run control prevents an upstream unit from swapping while a dependent build that read it is in progress. This couples schedules and adds state to run control.
 
-Reading upstream with Time Travel at the gate timestamp is **not** viable: published objects are recreated on each publication (Section 10.10), so an object published after the gate timestamp has no history at that time.
+Reading upstream with time travel at the gate timestamp is **not** viable: published objects are recreated on each publication (Section 10.10), so an object published after the gate timestamp has no history at that time.
 
 ### 10.10 Object identity: published objects are replaced on each publication
 
 Clone-and-swap gives every published table and view a **new object identity on every publication**. This is accepted as the baseline (Option A), with stated consequences:
 
-- **Time Travel** on a published object reaches back only to the creation of its current clone. History is served by history models (G8), not Time Travel.
+- **Time travel** on a published object reaches back only to the creation of its current clone. History is served by history models (G8), not time travel.
 - **Streams and dynamic tables** on published objects are not supported: a stream loses its offset and a dynamic table must reinitialise when its base object is replaced. Consumer rules are in Overview Section 9.4.
 - **Per-object history** (data metric function results, Snowsight lineage, `ACCESS_HISTORY` object ids) restarts with each publication. Impact and monitoring queries match by name.
 - **Disaster-recovery replication.** Clones replicate logically only when the original and the clone are in the same replication or failover group; otherwise they replicate as physical copies, and recreated objects can briefly disappear from the secondary during refresh. If the analytics databases are replicated, raw and analytics must share a replication or failover group, or analytics is excluded from replication and rebuilt from raw after failover. Whether the analytics databases are replicated is an open item (Section 16).
 
-**Option B: publish tables by transactional DML.** Views and frozen inputs keep swap-based publication; tables are built in the build schema, tested, and then written to stable published tables inside one multi-statement transaction (DML is transactional, whereas DDL auto-commits). Object identity is preserved, so Time Travel, streams and per-object history survive, at the cost of physical writes on each publication and more complex handling of incrementals. Spike S11 measures Option A's effects and costs Option B for selected Tier 1 marts, where stable identity may matter to consumers.
+**Option B: publish tables by transactional DML.** Views and frozen inputs keep swap-based publication; tables are built in the build schema, tested, and then written to stable published tables inside one multi-statement transaction (DML is transactional, whereas DDL auto-commits). Object identity is preserved, so time travel, streams and per-object history survive, at the cost of physical writes on each publication and more complex handling of incrementals. Spike S11 measures Option A's effects and costs Option B for selected Tier 1 marts, where stable identity may matter to consumers.
 
 ---
 
@@ -809,7 +809,7 @@ A full refresh of a published Silver incremental is a coordinated event (Overvie
 
 The spikes are run as one **walking skeleton**: one small source, one Tier 1 project and one Tier 2 project, end to end through lease, gate, freeze, build, test, swap, canonical state, watermark and CI. Several spikes interact (notably S1, S2, S3, S6, S8 and S12), and isolated passes do not prove the combination.
 
-| # | Spike | Question |
+|   | Spike | Question |
 |---|---|---|
 | S1 | View-relative resolution (**load-bearing**) | Create view `s1.v` as `select * from t`, swap `s1` with `s2`, check which `t` the view reads. Confirm `CREATE VIEW` accepts the bare identifier at creation; repeat for semantic views. Also clone `s1` and check the clone's view reads the clone's `t`. Documentation indicates a pass; failure invokes the contingency in Section 10.6 |
 | S2 | Swap and grants | Establish where schema-level `USAGE` ends up after `SWAP WITH`; confirm per-object grants travel with the swap; confirm no gap and no consumer access to build schemas under the chosen grant sequence |
@@ -821,7 +821,7 @@ The spikes are run as one **walking skeleton**: one small source, one Tier 1 pro
 | S8 | Concurrent units | Two Silver units concurrently on one live-version project object with distinct artifact paths: writeback, partial parsing and `--state` behave independently; which manifest `SYSTEM$DBT_GET_LAST_SUCCESSFUL_RUN_TARGET` returns; effect of a deployment during running units |
 | S9 | Frozen inputs | Frozen inputs stay invisible under per-object grants; retained storage from replaced transient clones on high-churn raw, and whether short retention contains it; classification tags carried onto derived columns and enforced in CI |
 | S10 | Consistent reads across units | Upstream schema clone at gate time (Section 10.9): correctness, privileges and cost; publication windows as the alternative |
-| S11 | Object identity | Effects of per-publication object replacement on Time Travel, data metric functions, lineage and replication; cost of DML publication (Option B) for selected Tier 1 marts |
+| S11 | Object identity | Effects of per-publication object replacement on time travel, data metric functions, lineage and replication; cost of DML publication (Option B) for selected Tier 1 marts |
 | S12 | Unit lease | Lease acquisition under concurrent attempts, expiry, stale `STARTED` detection, and the `DEPLOYED` trigger |
 | S13 | dbt Fusion (optional) | Compatibility of the custom macros and `run-operation` freeze with Fusion; whether strict static analysis validates columns of `source()` relations |
 
@@ -833,7 +833,7 @@ The spikes are run as one **walking skeleton**: one small source, one Tier 1 pro
 |---|---|
 | **Single gate over the whole Silver Layer** | One failing source would block every analytics team. Replaced by per-source publication units |
 | **Base models as tables** (copying raw) | Duplicates raw storage and build compute for 1:1 shaping. Replaced by views over frozen inputs |
-| **Pinned views over live raw** (watermark filter, or Time Travel `AT` in the view) | A watermark filter leaks in-place updates; Time Travel in a view is unconfirmed and fails outright once staleness exceeds raw's retention period |
+| **Pinned views over live raw** (watermark filter, or time travel `AT` in the view) | A watermark filter leaks in-place updates. Time travel in a view is unconfirmed and fails outright once staleness exceeds raw's retention period |
 | **Test live raw, then clone** | Anything landing between the tests and the clone would be published untested. Frozen inputs are cloned first and tested in place |
 | **Database-level blue/green swap**, with `ref` rendering schema-relative names | A known community pattern that fixes view binding. Rejected in favour of schema-level units: per-source isolation would need a database per unit, and the relative-reference side effects are the same. Revisit if spike S1 fails |
 | **Per-table `ALTER TABLE ... SWAP`** | Not atomic across a unit, so consumers could see inconsistent tables within one source |
@@ -841,7 +841,7 @@ The spikes are run as one **walking skeleton**: one small source, one Tier 1 pro
 | **Publishing tables by transactional DML** (Option B, Section 10.10) | Preserves object identity, at the cost of physical writes and more complex incrementals. Not the baseline; evaluated for selected Tier 1 marts in spike S11 |
 | **Separate internal and published schemas per unit** | Requires two swaps with a partial-failure state between them. Replaced by one schema per unit with per-object grants |
 | **Dynamic tables as published Silver objects** | Snowflake-managed refresh bypasses the gate. Internal use is optional spike S7 |
-| **Reading upstream with Time Travel for consistent reads** | Not viable: published objects are recreated on each publication (Section 10.9) |
+| **Reading upstream with time travel for consistent reads** | Not viable: published objects are recreated on each publication (Section 10.9) |
 | **Event-driven task graph from the start** | Viable, since tasks can share one ops schema while executing project objects anywhere, but graph failure semantics must be neutralised and a dispatcher adds state. Scheduled gated tasks first; a graph or stream-driven dispatcher later if latency requires it |
 | **Separate `dbt source freshness` step in the publish path** | Duplicates the gate's check against the same records and costs an extra execution per run. Kept for observability only |
 
@@ -850,7 +850,7 @@ The spikes are run as one **walking skeleton**: one small source, one Tier 1 pro
 ## 16. Open Items for the Detailed Design
 
 - Outcomes of spikes S1 to S13, and the contingency decision if S1 fails.
-- Agreement of the ingestion contract with the platform team (Section 4), before spikes start.
+- Agreement of the ingestion contract with the platform team (Section 4).
 - Whether the raw and analytics databases are replicated for disaster recovery, and if so, a shared replication or failover group (Section 10.10).
 - The changed-key pattern for incremental entity models (Section 6.6).
 - CDC history model specification: validity semantics, deletes, late-arriving changes (Section 6.7).
@@ -911,9 +911,4 @@ The spikes are run as one **walking skeleton**: one small source, one Tier 1 pro
 
 ---
 
-## Revision History
-
-| Version | Date | Changes |
-|---|---|---|
-| 1.2 | 2026-10-02 | Following HLD review: renamed from Bronze Layer Design and aligned with the medallion architecture; "aggregates" renamed entity models in `entities/`; dbt runtime policy (Core 1.11.11, Fusion later); `EXECUTE DBT PROJECT` result checking, default-version pinning and task-graph placement; canonical state for Slim CI; batch ingestion cadence and tightened ingestion contract; generated base models, rule of two and phased scope; G8 history with CDC history models and watermark-stamped snapshots; classification tags on derived columns; transient-table policy; Core admission criteria and Tier 2 access to conformed dimensions; one schema per publication unit; unit lease, `DEPLOYED` trigger and stale-run detection; single freshness check in the gate; S1 documentary evidence and contingency demoted; S10 led by upstream schema clone, Time Travel option dropped; object identity section (Option A baseline, Option B in S11); consumer manifest registry; spikes S11 to S13 and walking-skeleton approach |
-| 1.1 | 2026-10-01 | Proposed for review |
+---
