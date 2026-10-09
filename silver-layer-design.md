@@ -18,7 +18,7 @@
 
 ### 1.1 The Silver Layer as analytics infrastructure
 
-The Silver Layer (Tier 0 Source Entity modules and the Tier 0.5 Core module) is the foundation every analytics project builds on. In medallion terms, raw landed data is Bronze (owned by the platform team), the published outputs of the Silver Layer is Silver, and the published outputs of Tier 1 and Tier 2 projects are Gold.
+The Silver Layer (Tier 0 Source Entity modules and the Tier 0.5 Core module) is the foundation every analytics project builds on. In medallion terms, raw landed data is Bronze (owned by the platform team), the published outputs of the Silver Layer are Silver, and the published outputs of Tier 1 and Tier 2 projects are Gold.
 
 The Silver Layer's transformations are deliberately simple: shaping, never business logic. Yet it is where the hardest properties of the system meet:
 
@@ -50,9 +50,9 @@ The Overview (Section 3.2) promises consumers the following. Each is delivered b
 
 In scope: the ingestion contract, Silver project structure and stewardship, Source Entity and Core modules, frozen inputs, test placement, publication, freshness, run control, and the steward's duties towards consumers.
 
-Publication and run control are designed here because Silver's constraints drive them, but Tier 1 and Tier 2 projects use the same mechanism (Overview Section 9).
+Publication and run control are designed here because Silver's constraints drive them, but Tier 1 and Tier 2 projects use the same mechanism (Overview Section 10).
 
-Open items for the detailed design are listed in Section 15.
+Open items for the detailed design are listed in Appendix C.
 
 ---
 
@@ -71,12 +71,12 @@ The architecture uses embedded dbt deliberately, and replaces missing dbt-Labs c
 | Multi-statement transactions | The unit lease (Section 11.4); DML publication option (Section 9.8) | 11.4, 9.8 |
 | Snowflake Tasks | One gated, scheduled task per unit | 11.7 |
 | Caller's rights stored procedures | The generic publish procedure | 9.4 |
-| Database roles and per-object grants | Consumer access to published objects only | 9.7 |
+| Database roles and per-object grants | Consumer access to published objects only | 9.6 |
 | `persist_docs` (object and column comments) | Documentation inside Snowflake | 5.3 |
 | `ACCESS_HISTORY`, `OBJECT_DEPENDENCIES`, Snowflake lineage | Impact analysis across project boundaries | 12.2 |
 | Telemetry event table | dbt execution logs and traces | 11.1 |
 | Object tags with propagation, tag-based masking (including value-aware policies), row access policies | PII protection on raw, frozen inputs and derived published columns | 5.3, 6.4 |
-| Resource monitors, object and query tags | Cost control and attribution | 15 |
+| Resource monitors, object and query tags | Cost control and attribution | Appendix C |
 
 See [Appendix A: Snowflake Constraints and Prerequisites](#appendix-a-snowflake-constraints-and-prerequisites) for more details about technical behaviour of dbt Projects on Snowflake.
 
@@ -144,7 +144,7 @@ The no-business-logic rule for Tier 0 is the load-bearing rule of this architect
 
 - A named **steward team (of data engineers)** owns the repository, CI, releases, run control and on-call (business hours only) for the Silver Layer.
 - `CODEOWNERS` assigns each source module, and the Core module, to stewards. Contributions from any analytics team are welcome. Merges require steward approval, within the agreed review service level.
-- Stewards review against the structural join rule (Section 5.5), the scope-creep test (Section 5.5.2), test placement (Section 7) and classification (Section 7.3).
+- Stewards review against the structural join rule (Section 5.5), the scope-creep test (Section 5.5.2), test placement (Section 7) and classification (Section 5.3).
 - Generated base models (Section 5.2) and the rule of two for entity models (Section 5.8) keep the volume of contributions, and therefore the review load, low.
 
 ### 4.4 Splitting later
@@ -194,12 +194,12 @@ Base models are published for every table of an onboarded source, because they a
 - **Classification.** Masking and row access policies on raw carry over to frozen-input clones. Classification tags are created with **`PROPAGATE = ON_DEPENDENCY_AND_DATA_MOVEMENT`** and propagate to derived columns automatically, so no post-hook is needed and a masking policy attached to the tag applies to every derived column. The following are noteworthy behaviours related to tag-based classification and propagation in Snowflake:
   - Propagation covers `CREATE TABLE AS SELECT`, `MERGE`, `INSERT ... SELECT`, DDL-created targets, joins and **views** (the weaker `ON_DATA_MOVEMENT` stops at views, and base views are in every chain). Tags are present immediately.
   - Propagation follows lineage, not meaning: `lower`, `sha2`, `left`, `coalesce`, concatenation, `length` and aggregates all carry the tag; two values of one tag combine to a tag value of `CONFLICT`, policies still enforced.
-  - **Each classification tag needs a masking policy for every data type it can reach.** Functions that return metadata about the data rather than the data itself—like `length`, `count`, or structural aggregates do not propagate the tag.
+  - **Each classification tag needs a masking policy for every data type it can reach.** Functions that return metadata about the data rather than the data itself (like `length`, `count`, or structural aggregates) do not propagate the tag.
   - **Declassification is an explicit tag value, not an `UNSET`.** `UNSET TAG` is not durable (the next `MERGE` re-applies the propagated tag, and consumers see clear data in between). 
   - Creating a propagating tag requires `APPLY TAG ON ACCOUNT`, so tag creation is a governance capability, not a unit or steward one.
   - The Silver service role reads raw unmasked, so a `CREATE TABLE AS` under it stores clear values; **CI verification of the tag on derived columns remains the safety net**.
 
-- **Table type:** dbt-snowflake creates tables as transient by default. Rebuildable Silver tables (CDC current state, entity models) stay transient, avoiding Fail-safe storage on every publication. History models and snapshots, which cannot be rebuilt beyond raw's retention, are permanent (`transient: false`) and carry **`full_refresh: false`**, so a stray `--full-refresh` cannot destroy history (S4).
+- **Table type:** dbt-snowflake creates tables as transient by default. Rebuildable Silver tables (CDC current state, entity models) stay transient, avoiding Fail-safe storage on every publication. History models and snapshots, which cannot be rebuilt beyond raw's retention, are permanent (`transient: false`) and carry **`full_refresh: false`**, so a stray `--full-refresh` cannot destroy history.
 - **CDC deduplication and history** use the source ordering column (Section 3.1), not `_loaded_at` alone.
 - **Grants:** dbt `grants` config on published models only (Section 9.6).
 
@@ -475,7 +475,7 @@ EXECUTE DBT PROJECT silver.ops.silver_layer
           --target-path target/erp --log-path logs/erp';
 --
 --     The macro freeze_sources essentially does this for each source table (use source table orders
---     from <unit> erp as example:
+--     from <unit> erp as example):
 --     CREATE OR REPLACE TRANSIENT TABLE <db>.erp__build.raw__orders
 --       CLONE raw.erp.orders AT (timestamp => '<watermark>');
 --
@@ -485,8 +485,8 @@ EXECUTE DBT PROJECT silver.ops.silver_layer
 --     never published, and dropped after the swap. This also implies that the build can only include 
 --     views if they are against tables also part of the build and not upstream tables. In practice this 
 --     is not a significant restriction.
---     Zero-copy clones of each upstream published schema, taken now, again for the example 
---     of upstream source being erp:
+--     Zero-copy clones of each upstream published schema, taken now, for the example of core with
+--     upstream source being erp:
 CREATE OR REPLACE SCHEMA silver.core__in_erp CLONE silver.erp;
 
 -- 4. Test sources, build, test outputs: one dbt build
@@ -514,7 +514,7 @@ If any step before the swap fails, nothing published has changed: the previous f
 
 **Failure attribution.** The raised exception text names the failing node, so the procedure sets `failure_class` from it: a failing source test, or a freeze that names a raw object or time travel on one, is `source` (ingestion's); other tests and models are `transform` (the stewards'); anything else is `unclassified`. `SYSTEM$GET_DBT_LOG(<query id>)` returns the tail of the debug log, but the exception text, not the log, is what attributes the failure.
 
-**Roles.** The procedure runs as a per-unit service role that owns both of the unit's schemas, since `SWAP WITH` requires OWNERSHIP of both. The role reads raw and its upstream units, may execute the shared project object, and writes to run control only through an owner's-rights `log_event` procedure (unit roles have no `INSERT` on the log).
+**Roles.** The procedure runs as the unit's service role (per-unit or shared, Section 9.10) that owns both of the unit's schemas, since `SWAP WITH` requires OWNERSHIP of both. The role reads raw and its upstream units, may execute the shared project object, and writes to run control only through an owner's-rights `log_event` procedure (unit roles have no `INSERT` on the log).
 
 **Schema redirection.** A custom `generate_schema_name`, through a `unit_schema(unit)` macro, resolves each unit's schema by target. In production targets, the unit being published (`var('publish_unit')`) goes to `<unit>__build`; an upstream unit that it reads goes to its input clone `<publish_unit>__in_<upstream>` (variable `input_clones`); everything else resolves to the published schema. This is how the Core module reads last-good Source Entity outputs through `ref()` while keeping in-project lineage. In non-production targets every unit lives in `<target.schema>_<unit>` (Section 9.9). Sketch of the `unit_schema` macro:
 
@@ -549,7 +549,7 @@ Snowflake documents that rendering **same-schema references from views as unqual
 
 The same treatment applies to `source()` references from base views to frozen inputs. Base views depend on these Snowflake features:
 > - unqualified same-schema identifiers in views bind at query time in the view's own schema, 
-> - such views survive survive `SWAP WITH`, and 
+> - such views survive `SWAP WITH`, and 
 > - such views rebind under a schema `CLONE`. 
 
 #### IMPORTANT NOTE: Semantic views are different.
@@ -567,7 +567,7 @@ The same treatment applies to `source()` references from base views to frozen in
 6. **Consumers are granted object by object, never on build schemas.** Object grants come from dbt's `grants` config on published models only, never from future grants on tables. This keeps frozen inputs and internal models invisible to consumers. Grants on child objects travel with a schema clone and a swap. Schema-level `USAGE` **moves with the schema object, not the name**: a plain swap locks consumers out of the published name and exposes the previous version under the build name. The procedure therefore grants `USAGE` on the build schema just before the swap and revokes it from the new build schema just after (Section 9.4), so there is no gap and no consumer access to a build schema. A plain clone does not inherit managed access, and `ENABLE MANAGED ACCESS` needs the account-level `MANAGE GRANTS`, so the build schema is created with `CLONE ... WITH MANAGED ACCESS`, which keeps the published schema managed-access after every swap.
 7. **Each unit has its own artifact paths** on the shared project object.
 8. **Every `EXECUTE DBT PROJECT` failure is handled** (it raises, Appendix A.1) and every `SUCCESS` value is checked before the next step (Section 9.4).
-9. **A schema is deployed with `ADD VERSION`**, never `CREATE OR REPLACE`, once consumers hold grants (Appendix A.2).
+9. **The project object is deployed with `ADD VERSION`**, never `CREATE OR REPLACE`, once consumers hold grants (Appendix A.2).
 
 ### 9.7 Failure behaviour
 
@@ -580,19 +580,19 @@ The same treatment applies to `source()` references from base views to frozen in
 | Finance build fails | Finance marts stay at last good | Tier 2 gated by finance freshness |
 | Canonical state compile fails | Publication already complete | CI uses the previous canonical state; alert to stewards |
 | A run dies mid-way | Nothing published changed | Lease expires; `STARTED` without a terminal event is flagged as stale (Section 11.6) |
-| Raw table missing, or a raw column renamed | Nothing published changes. The freeze fails (class `source`) or the build fails (class `transform`) | Recovered by the next batch (observed, S3). A task's own status says nothing about this: tasks showed `SUCCEEDED` for publications that failed (because the publication process has completed), so monitoring reads run control |
+| Raw table missing, or a raw column renamed | Nothing published changes. The freeze fails (class `source`) or the build fails (class `transform`) | Recovered by the next batch. A task's own status says nothing about this: tasks showed `SUCCEEDED` for publications that failed (because the publication process has completed), so monitoring reads run control |
 
 
 ### 9.8 Object identity: published objects are replaced on each publication
 
-Clone-and-swap gives every published table and view a **new object identity on every publication**. This is accepted as the baseline (Option A), with stated consequences:
+Clone-and-swap gives every published table and view a **new object identity on every publication**. This is accepted as the baseline (Publication Option A), with stated consequences:
 
 - **Time travel** on a published object reaches back only to the creation of its current clone. History is served by history models (G8), not time travel.
-- **Streams and dynamic tables** on published objects are not supported: a stream loses its offset and a dynamic table must reinitialise when its base object is replaced. Consumer rules are in Overview Section 8.4.
+- **Streams and dynamic tables** on published objects are not supported: a stream loses its offset and a dynamic table must reinitialise when its base object is replaced. Consumer rules are in Overview Section 9.4.
 - **Per-object history** (data metric function results, Snowsight lineage, `ACCESS_HISTORY` object ids) restarts with each publication. Impact and monitoring queries match by name.
-- **Disaster-recovery replication.** Clones replicate logically only when the original and the clone are in the same replication or failover group; otherwise they replicate as physical copies, and recreated objects can briefly disappear from the secondary during refresh. If the analytics databases are replicated, raw and analytics must share a replication or failover group, or analytics is excluded from replication and rebuilt from raw after failover. Whether the analytics databases are replicated is an open item (Section 15).
+- **Disaster-recovery replication.** Clones replicate logically only when the original and the clone are in the same replication or failover group; otherwise they replicate as physical copies, and recreated objects can briefly disappear from the secondary during refresh. If the analytics databases are replicated, raw and analytics must share a replication or failover group, or analytics is excluded from replication and rebuilt from raw after failover. Whether the analytics databases are replicated is an open item (Appendix C).
 
-**Option B: publish tables by transactional DML.** Views and frozen inputs keep swap-based publication; tables are built in the build schema, tested, and then written to stable published tables inside one multi-statement transaction (DML is transactional, whereas DDL auto-commits). Object identity is preserved, so time travel, streams and per-object history survive, at the cost of physical writes on each publication and more complex handling of incrementals. Sufficient motivation would be required to justify the additional complexity.
+**Publication Option B: publish tables by transactional DML.** Views and frozen inputs keep swap-based publication; tables are built in the build schema, tested, and then written to stable published tables inside one multi-statement transaction (DML is transactional, whereas DDL auto-commits). Object identity is preserved, so time travel, streams and per-object history survive, at the cost of physical writes on each publication and more complex handling of incrementals. Sufficient motivation would be required to justify the additional complexity.
 
 ### 9.9 Development and CI targets
 
@@ -610,13 +610,13 @@ Required roles:
 
 > - A platform role that lands raw.
 > - A steward role that owns run control and shared objects.
-> - Database roles (`silver.reader`) for consumers, granted `USAGE` on a published schema only during the swap window of Section 9.4
+> - Database roles (`silver.reader`) for consumers, granted `USAGE` on published schemas; the grant sequence in Section 9.4 keeps it on the published name across the swap
 > - A governance role that owns tags and masking policies
 
 Secondary roles should be disabled. The detailed design would need to choose between two role designs relating to the units:
 
- - **Option A:** One service role per unit (`SVC_SILVER_<UNIT>`) that owns the unit's schemas, is named in the unit's dbt target, may execute the shared project object (`USAGE` on the DBT PROJECT) and reads its raw schema. A task is owned by the unit's service role, so tasks and roles are per unit.
- - **Option B:** A single shared Silver service role that owns every unit schema would permit one task graph (Section 11.7), at the price of every unit being able to touch every other unit's schemas.
+ - **Role Option A:** One service role per unit (`SVC_SILVER_<UNIT>`) that owns the unit's schemas, is named in the unit's dbt target, may execute the shared project object (`USAGE` on the DBT PROJECT) and reads its raw schema. A task is owned by the unit's service role, so tasks and roles are per unit.
+ - **Role Option B:** A single shared Silver service role that owns every unit schema would permit one task graph (Section 11.7), at the price of every unit being able to touch every other unit's schemas.
 
 ---
 
@@ -633,7 +633,7 @@ Completion is not freshness. Every cross-unit dependency needs a freshness asser
 Every publication unit carries a **watermark**: the time its data is current as of.
 
 - A raw source's watermark is the time of its latest landing-complete record (Section 3).
-- A Source Entity unit's watermark is the freeze timestamp of its frozen inputs, the watermark of it's upstream raw source.
+- A Source Entity unit's watermark is the freeze timestamp of its frozen inputs, the watermark of its upstream raw source.
 - Any other unit's watermark is the **minimum of its upstream watermarks**, read at gate time.
 
 Staleness therefore propagates automatically. In the example above, the Tier 2 unit's watermark is digital's three-day-old watermark, not finance's fresh one.
@@ -712,7 +712,7 @@ Static configuration is maintained in a small ops repository and deployed as see
 
 ```sql
 -- One row per publication unit, including raw units owned by the platform team
-units (unit, tier, owner, dbt_project_object, selector, schedule, max_runtime_minutes)
+units (unit, tier, owner, dbt_project_object, dbt_target, selector, schedule, max_runtime_minutes)
 
 -- One row per dependency edge; this is the cross-project dependency graph
 unit_dependencies (unit, upstream_unit, max_age_hours)
@@ -796,7 +796,7 @@ On every production deployment, each Tier 1 and Tier 2 project's CI writes the s
 
 Silver CI generates the consumers' source definitions from the Silver manifest (published relations, column names, types, descriptions, classification tags, model versions and deprecation dates) and releases a new package version automatically with each Silver release. The package also carries shared macros and generic tests, including `upstream_fresh` and a deprecation test that warns as a consumed version approaches its `deprecation_date` (dbt's own deprecation warnings never reach `source()` consumers). It contains no models. Generation removes source-sync drift as a failure mode. Frozen inputs and other unpublished objects are excluded.
 
-The package is tagged with a moving major-version tag (`v1`) as well as an exact version, so consumers pick up additive releases by refreshing their `package-lock.yml` rather than editing a pin (Overview Section 5.2).
+The package is tagged with a moving major-version tag (`v1`) as well as an exact version, so consumers pick up additive releases by refreshing their `package-lock.yml` rather than editing a pin (Overview Section 6.2).
 
 ### 12.2 Impact analysis
 
@@ -810,13 +810,13 @@ Because published objects are replaced on each publication (Section 9.8), these 
 
 ### 12.3 Versioning duty
 
-Every published Silver model is versioned from v1. Every breaking change is made through a new dbt model version with a `deprecation_date`, following the process in Overview Section 7.2. Both versions publish side by side until the date. Additive changes need no version.
+Every published Silver model is versioned from v1. Every breaking change is made through a new dbt model version with a `deprecation_date`, following the process in Overview Section 8.2. Both versions publish side by side until the date. Additive changes need no version.
 
 Breaking changes are batched into a predictable cadence (once or twice a year, announced in advance), following dbt's guidance for widely used models.
 
 ### 12.4 Full-refresh coordination
 
-A full refresh of a published Silver incremental is a coordinated event (Overview Section 7.5). The stewards announce it to consumers found by the impact query, run it through the normal publication procedure so it is still gated, and log a FULL_REFRESH event in run control. History models and snapshots are never fully refreshed, since their history cannot be rebuilt beyond raw's retention.
+A full refresh of a published Silver incremental is a coordinated event (Overview Section 8.5). The stewards announce it to consumers found by the impact query, run it through the normal publication procedure so it is still gated, and log a FULL_REFRESH event in run control. History models and snapshots are never fully refreshed, since their history cannot be rebuilt beyond raw's retention.
 
 --- 
 
@@ -864,18 +864,18 @@ A full refresh of a published Silver incremental is a coordinated event (Overvie
 
 ---
 
-## <a id="appendix-a-snowflake-constraints-and-prerequisites"> Appendix A. Snowflake Constraints and Prerequisites
+## <a id="appendix-a-snowflake-constraints-and-prerequisites"> Appendix A. Snowflake Constraints and Prerequisites</a>
 
 ### A.1 Verified Constraints of dbt Projects on Snowflake
 
 These documented Snowflake behaviours shape the design:
 
 - **Only listed dbt commands are supported.** `build`, `run`, `test`, `seed`, `snapshot`, `run-operation`, `compile`, `list`, `parse`, `show`, `deps`, `clean`, `retry` and `source freshness` are supported through `EXECUTE DBT PROJECT`. **`source freshness`, `retry` and `clean` require a live-version project object** (Section A.2). The newer `dbt freshness` command is not listed, so this design uses `dbt source freshness`.
-- **Failure is raised, not returned .** `EXECUTE DBT PROJECT` raises a Snowflake error when dbt fails: a model's warehouse error, a test at `error` severity, a compile error, a missing selector, a failing `run-operation` and an unsupported command all raise. The error text carries dbt's output, names the failing node and includes a query id for `SYSTEM$GET_DBT_LOG`. Tests at `warn` severity, `compile` and `source freshness` return normally with `SUCCESS = true`. The result has three columns, `SUCCESS`, `EXCEPTION` and `STDOUT`, which are read by name; on success `EXCEPTION` is the string `'None'`, not `NULL`. The publish procedure therefore wraps every execution in an exception handler, classifies the failure from the raised text, and also checks `SUCCESS` (Section 9.4).
+- **Failure is raised, not returned.** `EXECUTE DBT PROJECT` raises a Snowflake error when dbt fails: a model's warehouse error, a test at `error` severity, a compile error, a missing selector, a failing `run-operation` and an unsupported command all raise. The error text carries dbt's output, names the failing node and includes a query id for `SYSTEM$GET_DBT_LOG`. Tests at `warn` severity, `compile` and `source freshness` return normally with `SUCCESS = true`. The result has three columns, `SUCCESS`, `EXCEPTION` and `STDOUT`, which are read by name; on success `EXCEPTION` is the string `'None'`, not `NULL`. The publish procedure therefore wraps every execution in an exception handler, classifies the failure from the raised text, and also checks `SUCCESS` (Section 9.4).
 
 - **The runtime version defaults to 1.9.4.** Unless `DBT_VERSION` is set on the project object or the execution, dbt 1.9.4 is used. Every project object pins its version (Section A.3). A `DBT_VERSION` on one execution overrides the object's pin for that execution only.
 - **Concurrent executions need distinct artifact paths.** Several executions of one project object may run at once. With writeback enabled, each should use distinct, non-overlapping `--target-path` and `--log-path` directories inside the project. Execution artifacts are to be kept regardless of writeback.
-- **Caller's rights procedures.** Stored procedures that call `EXECUTE DBT PROJECT` must be caller's rights procedures. The execution runs as the role in the project's profile, further restricted to the caller's privileges. Because the procedure creates schemas as the caller's primary role while dbt runs as the profile role, **each unit must be published by its own service role** with its own dbt target. The dynamic `ARGS` of `EXECUTE DBT PROJECT` can be built with `EXECUTE IMMEDIATE` and its result read with `RESULT_SCAN(LAST_QUERY_ID())`.
+- **Caller's rights procedures.** Stored procedures that call `EXECUTE DBT PROJECT` must be caller's rights procedures. The execution runs as the role in the project's profile, further restricted to the caller's privileges. Because the procedure creates schemas as the caller's primary role while dbt runs as the profile role, **each unit must be published by the unit's service role** (per-unit or shared, Section 9.10) with its own dbt target. The dynamic `ARGS` of `EXECUTE DBT PROJECT` can be built with `EXECUTE IMMEDIATE` and its result read with `RESULT_SCAN(LAST_QUERY_ID())`.
 - **User-managed warehouses.** Tasks that execute `EXECUTE DBT PROJECT` must specify a user-managed warehouse; serverless tasks cannot be used. The warehouse is named in the dbt profile.
 - **Dependencies are installed in CI.** Running `dbt deps` in CI and deploying with `dbt_packages` included avoids the need for an external access integration.
 - **Managed dbt runtime.** Snowflake manages the dbt runtime. Arbitrary Python plugins cannot be installed.
@@ -905,7 +905,7 @@ Consequences for this design:
 - **Partial parsing needs constant inputs per path.** Changing `--vars`, `profiles.yml`, `dbt_project.yml`, packages, the dbt version or `generate_x_name`/builtin overrides forces a full re-parse. Each unit always runs with the same `--vars` in its own target path, so its partial-parse state stays valid.
 - **Opting in.** An account opts in by enabling the 2026_06 bundle (check with `SYSTEM$BEHAVIOR_CHANGE_BUNDLE_STATUS('2026_06')`), or by asking the Snowflake account representative to enable the separate single-live-version feature. New or replaced project objects are then live-version objects; existing objects migrate with `SYSTEM$MIGRATE_DBT_PROJECT`. Once the bundle is fully released, remaining versioned objects are migrated automatically, **so this is Snowflake's direction of travel regardless**.
 
-**Deployment is in place.** A release is `ALTER DBT PROJECT ... ADD VERSION FROM <Git path>`, which replaces the live version's files and **keeps the object, the unit roles' grants and the canonical state of earlier executions**. `CREATE OR REPLACE DBT PROJECT` drops every grant on the object and makes all earlier executions' artifacts unreachable, so it is for first creation only.The Git commit can be read from `SHOW DBT PROJECTS` (`last_deployed_from`).
+**Deployment is in place.** A release is `ALTER DBT PROJECT ... ADD VERSION FROM <Git path>`, which replaces the live version's files and **keeps the object, the unit roles' grants and the canonical state of earlier executions**. `CREATE OR REPLACE DBT PROJECT` drops every grant on the object and makes all earlier executions' artifacts unreachable, so it is for first creation only. The Git commit can be read from `SHOW DBT PROJECTS` (`last_deployed_from`).
 
 **Canonical state.** A unit's production run compiles its own models into `<unit>__build` schemas (Section 9.4), so its manifest is the wrong state for CI: `--defer` would resolve unselected models to build schemas, which hold the previous version after a swap and a half-built one during the next run. In addition, `SYSTEM$DBT_GET_LAST_SUCCESSFUL_RUN_TARGET` takes a project object, not a target path, so with several units on one object it returns whichever unit finished last. Therefore:
 
@@ -927,7 +927,7 @@ Tier 1 and Tier 2 projects follow the same pattern.
 
 ## Appendix B. Alternatives Considered
 
-As part of developing this design document, many small tests and spikes were run on a Snowflake trial account to validate the documented behaviour of Snowflake objects as discussed in this document. the Snowflake documentation (and also the dbt-Labs documentation) was found to be excellent and consistent with tested functionality. The build of this design will no doubt present quirks and challenges as per any system design and build process. This is the point of providing a HLD which motivates a subsequent LLD. The sophistication and well-documented successes of both dbt Core and the Snowflake platform inspire confidence that all challenges can be resolved.
+As part of developing this design document, many small tests and spikes were run on a Snowflake trial account to validate the documented behaviour of Snowflake objects as discussed in this document. The Snowflake documentation (and also the dbt-Labs documentation) was found to be excellent and consistent with tested functionality. The build of this design will no doubt present quirks and challenges as per any system design and build process. This is the point of providing a HLD which motivates a subsequent LLD. The sophistication and well-documented successes of both dbt Core and the Snowflake platform inspire confidence that all challenges can be resolved.
 
 A number of alternatives were considered and rejected for this design based mainly on conceptual considerations. These are documented here as there may be reason later to reconsider.
 
@@ -959,8 +959,9 @@ A number of alternatives were considered and rejected for this design based main
 - **Input-clone privilege model** for units that read other units: inherited unit roles (as tested), a steward-owned clone step, or a dedicated read-only role.
 - **One shared Silver service role versus a role and task per unit** (Section 9.10).
 - **Untested deployment cases**: removal of files with `ADD VERSION`, and a change of dbt version through it (Appendix A.2).
+- **Tier 1 and Tier 2 build:** Production build requires redirecting `source()` references to input clones.
 - **Clone time at production volumes**, and whether the analytics databases' retention settings follow Section 6.4.
-- **Publication windows** as an alternative to input clones, if clone cost proves material (Section 9.6).
+- **Publication windows** as an alternative to input clones, if clone cost proves material (Appendix B).
 - **Semantic views**: handling of new columns, which lag one publication (Section 9.5).
 - **Masking policies per data type** for every classification tag, and the governance review of declassification (Section 5.3).
 - Agreement of the ingestion contract with the platform team (Section 3).
