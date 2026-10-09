@@ -6,11 +6,11 @@
 
 | | |
 |---|---|
-| **Version** | 1.3 |
-| **Date** | 2026-10-05 |
-| **Status** | **Proposed** for review |
-| **Proposed By** | Olav Jordens, Lead Data Engineer, PSM CAI |
-| **Companion document** | *Silver Layer Design* v1.3 (referred to below as **SLD**) |
+| **Version** | 1.5 |
+| **Date** | 2026-10-09 |
+| **Status** | **Proposed** |
+| **Proposed By** | Olav Jordens (Lead Data Engineer, PSM CAI) dbt Certified Developer |
+| **Companion document** | *Silver Layer Design* v1.5 (referred to below as **SLD**) |
 
 ---
 
@@ -18,7 +18,7 @@
 
 The organisation has adopted Snowflake and intends to use open source dbt across multiple independent analytics teams, without proprietary dbt-Labs products. This document describes a multi-project dbt architecture built on **dbt Projects on Snowflake** (dbt Core, executed inside Snowflake). It uses **Snowflake's own feature set to replace dbt Mesh and dbt Cloud** wherever possible (Section 10).
 
-It balances **enterprise governance** (version control, contracts, tests, access control) with **team independence** (separate repositories, CI/CD, development and ownership, with integrated production pipelines).
+It balances **enterprise governance** (version control, contracts, tests, access control) with **team independence** (separate repositories, CI, development and ownership, with integrated production pipelines).
 
 dbt work is classified into Tiers, mapped onto the medallion layers:
 
@@ -81,12 +81,12 @@ In scope: the Tier structure, inter-project coupling, consumer and contributor r
 
 - **Snowflake** as warehouse, including first class support for lineage, cloning and time travel. 
 - **dbt Projects on Snowflake.** Projects are Snowflake objects deployed from a Git repository and invoked with `EXECUTE DBT PROJECT`. Snowflake manages the dbt runtime.
-- **dbt runtime: dbt Core 1.11.11**, pinned explicitly with `DBT_VERSION` on every project object (otherwise `EXECUTE DBT PROJECT` defaults, currently to 1.9.4). dbt Fusion is the expected next runtime, adopted once its stability and migration path are confirmed (SLD Section 3.3).
+- **dbt runtime: dbt Core 1.12.3** (with dbt-snowflake 1.12.0), pinned explicitly with `DBT_VERSION` on every project object (otherwise `EXECUTE DBT PROJECT` defaults, currently to 1.9.4). dbt Fusion is the expected next runtime, adopted once its stability and migration path are confirmed.
 - **dbt Mesh and dbt Cloud are unavailable.** Cross-project `ref` requires dbt-Labs Enterprise plans and metadata service; it is not available in dbt Core or Fusion standalone.
 - **Multiple independent analytics teams** with separate sprints, CI and ownership, using a common set of enterprise data sources.
 - **Snowflake Tasks** for scheduling and cross-project coordination.
 - **Platform team owns ingestion only.** Analytics owns everything beyond the raw Bronze layer.
-- **Batch ingestion.** Source data, including change-data-capture records, lands in batches on a daily or hourly cadence. The design is batch-oriented; continuous ingestion is a future extension (SLD Section 4.2).
+- **Batch ingestion.** Source data, including change-data-capture records, lands in batches on a daily or hourly cadence. The design is batch-oriented; continuous ingestion is a future extension (SLD Section 3.2).
 
 ### 2.1 Snowflake prerequisite: live-version dbt project objects
 
@@ -97,7 +97,7 @@ The architecture assumes **live-version** dbt project objects (Snowflake 2026_06
 - partial parsing
 - `--state` comparisons, including Slim CI and defer to production
 
-Version history of project code then lives in Git only. Because publication redirects models into build schemas, the artifacts of an ordinary production run are **not** a valid state for CI; a canonical state run is recorded after each publication (SLD Section 3.2). Details, and how to opt in, are in SLD Section 3.
+Version history of project code then lives in Git only. Because publication redirects models into build schemas, the artifacts of an ordinary production run are **not** a valid state for CI; a canonical state run is recorded after each publication (SLD Appendix A.2). Details, and how to opt in, are in SLD Appendix A.
 
 ---
 
@@ -115,8 +115,7 @@ Raw / Landing                                                                 �
         │
         └──► Tier 1 (Domains)               ◄─ may read Tier 0 and Tier 0.5   ┐   Gold Layer (published outputs)
               │                                                               ├─    plus internal models
-              └──► Tier 2 (Cross-Domain)    ◄─ may read Tier 1 marts and      ┘     (Multiple dbt projects)
-                                               Tier 0.5 conformed dimensions
+              └──► Tier 2 (Cross-Domain)    ◄─ may read Tier 1 and Tier 0.5   ┘     (Multiple dbt projects)
 ```
 
 - **Tier 0 is purely data shaping.** It contains no business logic and no cross-source joins.
@@ -133,7 +132,7 @@ Every analytics project starts by assessing the Silver Layer's published outputs
 
 The Silver Layer's scope is **phased**. Release 1 publishes base models (1:1 with source tables), change-data-capture current state and SCD2 history. Entity models (denormalised logical entities) follow once the publication machinery is proven, and are admitted by a rule of two (Section 7.1).
 
-A named **steward team** owns the Silver Layer's repository, CI, releases and operations, and approves every contribution within an agreed review service level.
+A named **steward team** owns the Silver Layer's repository, CI/CD, releases and operations, and approves every contribution within an agreed review service level.
 
 ### 3.2 What the Silver Layer guarantees to consumers
 
@@ -146,7 +145,7 @@ A named **steward team** owns the Silver Layer's repository, CI, releases and op
 | G5 | **Versioned** | Every published model is versioned from v1. Breaking changes arrive as a new model version, alongside the old one, with a stated deprecation date |
 | G6 | **Shaping only** | No business logic, except the governed identity resolution and conformance in Tier 0.5 |
 | G7 | **Stable keys** | Durable keys issued by Tier 0.5 (for example `customer_key`) are never reassigned |
-| G8 | **Historised** | Where a source changes records in place, history is published with system-time validity taken from the source's own change ordering, so as-at queries are possible |
+| G8 | **Historicised** | Where a source changes records in place, history is published with system-time validity taken from the source's own change ordering, so as-at queries are possible |
 
 How each guarantee is achieved is described in the SLD.
 
@@ -179,7 +178,7 @@ In addition to `sources/` provided through the Silver Layer (using the source pa
 Only `marts/`, `semantic/`, `presentation/` and `features/` are consumable outside the project. This is enforced by grants, not by convention. Models are published in groups called *units*.
 
 - **One schema per publication unit.** Published and internal models of a unit build into the same schema, so the whole unit publishes with a single atomic swap (Section 9). Published models are distinguished by naming prefix (`dim_`, `fct_`, `sem_`, `pres_`, `feat_`).
-- **Internal models are never granted.** Consumer access is granted per published model, using dbt's `grants` config. Internal models carry no grants, so no other role can read them. This is the same mechanism that keeps the Silver Layer's frozen inputs invisible (SLD Section 7).
+- **Internal models are never granted.** Consumer access is granted per published model, using dbt's `grants` config. Internal models carry no grants, so no other role can read them. This is the same mechanism that keeps the Silver Layer's frozen inputs invisible (SLD Section 6).
 - **A project may define more than one publication unit** when parts of it have independent consumers (for example, ML features separate from finance marts), so that a failing test in one part does not hold back the other. One unit per project is the default.
 
 A downstream project that needs an intermediate model has found a modelling gap. The answer is to promote the model to a mart, not to grant access.
@@ -217,7 +216,7 @@ Notes:
 ### 4.5 One semantic layer
 
 - Metrics are defined once, in the domain that owns the concept, as Snowflake semantic views.
-- Cross-domain metrics are defined in the Tier 2 project that owns the question, and may not redefine a Tier 1 metric.
+- Cross-domain metrics are defined in the Tier 2 project that owns the analysis, and may not redefine a Tier 1 metric.
 
 ### 4.6 Conformed keys pass through unaltered
 
@@ -246,7 +245,7 @@ Tier 2 depends on Tier 1 outputs and on Tier 0.5 conformed dimensions only. Anal
 
 ### 6.1 The mechanism: `source()` to published outputs
 
-A higher-Tier project declares the published relations it reads as dbt sources, resolved per environment:
+A higher-Tier project declares the published relations it reads as dbt `sources`, resolved per environment:
 
 ```yaml
 sources:
@@ -265,7 +264,7 @@ sources:
 
 > **Never hard-code a production database name in source definitions.** Resolution is by `env_var` or by target, always. `EXECUTE DBT PROJECT` supplies these through its `ENV_VARS` parameter. This lets the same project run against development, CI and production.
 
-The dbt community calls this pattern the *source-hack*. Combined with the Tier structure and Snowflake's lineage and cloning, it gives most of what dbt Mesh offers (Section 10). Note that cross-project references in dbt Mesh resolve in a similar way, but the dbt-Labs platform provides a far greater level of integration across multiple projects. The remaining gaps are listed in Section 6.4.
+The dbt community calls this pattern the *source-hack* as it extends the original intention of the `source`. Combined with the Tier structure and Snowflake's lineage,  cloning, and schema swapping, it gives most of what dbt Mesh offers (Section 10). Note that cross-project references in dbt Mesh resolve in a similar way, but the dbt-Labs platform provides a far greater level of integration across multiple projects. The remaining gaps are listed in Section 6.4.
 
 **NOTE: Development and CI environments of Tier 1 and Tier 2 projects read the production Silver Layer directly**, read-only. No clone of Silver is needed for downstream development, just as no clone of Raw is needed for Silver development.
 
@@ -308,7 +307,7 @@ Snowflake has documented an approach to cross-project dependencies using a copy 
 |-----------|------------|---------------|
 | No compile-time validation of upstream schema | Contracts and versioning from v1 in the producing project; generated source package; breaking changes only through model versions. dbt Fusion's strict static analysis may later add compile-time column validation (spike S13) | A producer can still break a consumer between version bumps; rare for the shaping-only Silver Layer |
 | dbt DAG severed at the project boundary | Snowflake lineage spans the boundary; column descriptions travel in the source package and in Snowflake | The dbt DAG view alone stops at the boundary |
-| `state:modified` does not cross the boundary | Each project compares against its own canonical production state (SLD Section 3.2) | Cross-project impact is found with an impact query (Section 8.3), not dbt |
+| `state:modified` does not cross the boundary | Each project compares against its own canonical production state | Cross-project impact is found with an impact query (Section 8.3), not dbt |
 | Freshness of upstream projects is not visible in dbt by default | Watermarks in run control and the `upstream_fresh` test (Section 9) | None significant |
 
 ---
@@ -319,7 +318,7 @@ The Silver Layer does not take much effort to set up once the raw Bronze Layer i
 
 ### 7.1 When to contribute
 
-Contribute when your project needs a source system, an entity model or a source test that the Silver Layer does not yet publish. **Base models for onboarded sources are generated** (Silver stewards can easily set this up), so a contribution is rarely needed just to read a table. Do not rebuild shaping logic inside a Tier 1 project: every other team would have to rebuild it too.
+Contribute when your project needs a source system, an entity model or a source test that the Silver Layer does not yet publish. **Base models for onboarded sources are generated** (Silver stewards can easily set this up), so a contribution is rarely needed just to read a table. Do not rebuild shaping logic inside a Tier 1 project: every other team would have to rebuild it too. The organisation manages and monitors consistent source data structure, quality and presentation into the analytics community through the Silver Layer.
 
 **Entity models are admitted by a rule of two:** an entity model enters the Silver Layer when two consumers need it, or when the stewards judge the source too normalised to consume through base models alone. Until then, the join belongs in the Tier 1 project that needs it.
 
@@ -334,8 +333,8 @@ Contribute when your project needs a source system, an entity model or a source 
 - **The structural join rule.** Joins follow the source's own foreign keys, preserve the entity root's grain or enrich many:1, and would be made regardless of any analysis. `order_items LEFT JOIN orders ON order_items.order_id = orders.order_id` is allowed; `... WHERE orders.status = 'completed'` is not.
 - **Permitted filters.** Only source-semantic filters are allowed: soft deletes, CDC deduplication, and tenant scoping.
 - **The scope-creep test.** **If two competent analysts could compute it differently, it belongs in Tier 1.** `order_item_count` is shaping; `net_revenue` is business logic.
-- **Test placement.** Tests are placed where the defect can first occur. Source assertions (not null, accepted values, castability, uniqueness at the source's grain) go on the Silver **frozen inputs**. Tests of shaping logic (entity grain, fan-out, deduplication, history validity) go on Silver outputs. Most tests a Tier 1 team contributes are source assertions. See SLD Section 8.
-- **Classification.** Every new published column derived from a classified source column carries the source column's classification tag. CI checks this against the raw tags.
+- **Test placement.** Tests are placed where the defect can first occur. Source assertions (not null, accepted values, castability, uniqueness at the source's grain) go on the Silver **frozen inputs**. Tests of shaping logic (entity grain, fan-out, deduplication, history validity) go on Silver outputs. Most tests a Tier 1 team contributes are source assertions. See SLD Section 7.
+- **Classification.** Classification tags propagate automatically from raw through the Silver Layer to derived columns, and the tag's masking policy applies to them. A derived column that is genuinely not sensitive is declassified by an explicit, reviewed tag value, never by removing the tag (SLD Section 5.3). CI checks derived columns against the raw tags.
 
 ---
 
@@ -393,7 +392,7 @@ Versioned models materialise to **distinct relations** (`ent_erp__orders_v1`, `e
 
 **Cadence.** Following dbt-Labs guidance, breaking changes to widely used models are batched into a predictable version cadence (once or twice a year, announced in advance) rather than released one at a time. This applies to the Silver Layer in particular.
 
-dbt's `latest_version_pointer` (an unversioned view onto the latest version) requires dbt 1.12 and is not available on the pinned runtime. Consumers always reference an explicit version.
+dbt's `latest_version_pointer` (an unversioned view onto the latest version) requires dbt 1.12, which is the pinned runtime, so it is available. This design keeps consumers on an explicit version: a pointer would move consumers to a new version without their migration, which is what the deprecation window exists to avoid.
 
 ### 8.3 Impact analysis
 
@@ -431,15 +430,16 @@ If a Silver model is fully refreshed, downstream incrementals may rest on shifte
 
 ## 9. Publication and Freshness in Your Project
 
-Tier 1 and Tier 2 projects use the same publication and freshness mechanism as the Silver Layer (SLD Sections 10 to 12). What it means for a project team:
+Tier 1 and Tier 2 projects use the same publication and freshness mechanism as the Silver Layer (SLD Sections 9 to 11). What it means for a project team:
 
 ### 9.1 Publication
 
 - **Each project is a publication unit** by default (Section 4.3). A unit has one schema, holding published and internal models, and a build counterpart.
 - **Builds happen in a zero-copy clone** of the last good state. Only if the build reports success and every `error`-severity test passes is the clone swapped into place, atomically.
-- **A failed build changes nothing.** Consumers keep the last good version, so a failure shows downstream as staleness, not as wrong data. There is nothing to roll back.
-- **A code release triggers a build.** Deploying a new version of the project records a `DEPLOYED` event, which lets the next gated run publish even if no upstream data has changed.
-- **Published outputs are materialised.** Views are permitted in published schemas only under the rules in SLD Section 10.
+- **A failed build changes nothing.** Consumers keep the last good version, so a failure shows downstream as staleness, not as wrong data. There is nothing to roll back. Resolving the failure leads to recovery on the next batch.
+- **A unit that reads other Silver units reads consistent upstream versions.** At the gate, the unit takes zero-copy clones of the upstream published schemas it reads, and builds against those, so an upstream publication mid-build cannot split its reads between two versions (SLD Section 9.9).
+- **A code release triggers a build.** Deploying a new version of the project records a `DEPLOYED` event, which lets the next gated run publish even if no upstream data has changed. Deployment is an in-place `ALTER DBT PROJECT ... ADD VERSION`, which keeps the project object's grants and canonical state (SLD Appendix A.2).
+- **Published outputs are materialised.** Views are permitted in published schemas only under the rules in SLD Section 9.
 - **Test severity carries meaning.** `error` blocks publication; `warn` publishes and is logged. Use `error` only for tests that evidence wrong data.
 
 ### 9.2 Freshness
@@ -459,14 +459,12 @@ Tier 1 and Tier 2 projects use the same publication and freshness mechanism as t
 
 ### 9.4 Published objects are replaced on every publication
 
-Publishing by clone and swap means every published table and view is a **new Snowflake object** after each publication. This is an accepted consequence of the design (SLD Section 10.10). For consumers it means:
+Publishing by clone and swap means every published table and view is a **new Snowflake object** after each publication. This is an accepted consequence of the design (SLD Section 9.10). For consumers it means:
 
 - **Do not create streams or dynamic tables on published objects.** A stream loses its offset, and a dynamic table must reinitialise, whenever the object is replaced.
-- **Time Travel on a published object reaches back only to its current publication.** For history, use the published history models (G8); for "what changed", use the run-control log.
+- **Time travel on a published object reaches back only to its current publication.** For history, use the published history models (G8); for "what changed", use the run-control log.
 - **The change signal is the watermark and the `PUBLISHED` event in run control**, not object metadata. Downstream incrementals filter on data columns (for example `_loaded_at`), never on table versions.
 - **Monitoring that is keyed to object ids** (data metric function history, lineage, access history) restarts with each publication; query by name.
-
-Publishing selected Tier 1 marts by transactional DML instead, which preserves object identity, is being evaluated in spike S11.
 
 ---
 
@@ -480,20 +478,20 @@ Embedded dbt on Snowflake was chosen deliberately, so this architecture uses Sno
 |---|---|---|---|
 | Cross-project references | dbt Mesh cross-project `ref` | `source()` to published outputs; generated source package (Section 6) | Design |
 | Cross-project access control | Mesh model access (`public`, `protected`, `private`) | One schema per unit, database roles, per-model grants via dbt `grants`; internal models never granted | Design |
-| Hosted execution and IDE | dbt Cloud | dbt project objects, `EXECUTE DBT PROJECT`, Snowsight Workspaces; dbt Core 1.11.11 pinned with `DBT_VERSION` | Documented |
+| Hosted execution and IDE | dbt Cloud | dbt project objects, `EXECUTE DBT PROJECT`, Snowsight Workspaces; dbt Core 1.12.3 pinned with `DBT_VERSION` | Documented |
 | Job scheduling | dbt Cloud jobs | Snowflake Tasks, one gated task per publication unit | Documented |
-| State-aware orchestration | dbt Cloud (Fusion) | Freshness gates and propagated watermarks in run control (SLD Section 12) | Design |
+| State-aware orchestration | dbt Cloud (Fusion) | Freshness gates and propagated watermarks in run control (SLD Section 11) | Design |
 | Source freshness scheduling and history | dbt Cloud jobs and dbt Explorer (the `dbt source freshness` command itself is dbt Core) | Freshness gate on landing-complete records in run control; `dbt source freshness` on live-version objects for observability | Documented |
-| Slim CI and defer to production | dbt Cloud CI | Live-version `--state`, imported from the canonical state run (SLD Section 3.2); per-pull-request databases (Snowflake has a published Slim CI tutorial) | Documented, with design caveat |
+| Slim CI and defer to production | dbt Cloud CI | Live-version `--state`, imported from the canonical state run (SLD Appendix A.2); per-pull-request databases (Snowflake has a published Slim CI tutorial) | Documented, with design caveat |
 | Development environments | dbt Cloud environments | Per-developer and per-pull-request databases; downstream projects read production Silver read-only | Design |
-| Write-audit-publish | (none built in) | Clone, build, test, atomic `SWAP` (SLD Section 10) | Design |
+| Write-audit-publish | (none built in) | Clone, build, test, atomic `SWAP` (SLD Section 9) | Design |
 | Documentation and DAG | dbt Explorer | `persist_docs` into Snowflake; Snowsight dbt project details page; `dbt docs generate --static` | Documented |
 | Cross-project lineage and impact | dbt Explorer | Snowflake lineage (including column-level lineage in the dbt DAG), `ACCESS_HISTORY`, consumer manifest registry (Section 8.3) | Documented |
 | Run metadata | dbt Discovery API | dbt artifacts written back to live-version objects; Snowflake telemetry event table; run-control log | Documented |
 | Semantic layer | dbt Semantic Layer (MetricFlow) | Snowflake semantic views, built from dbt (Snowflake-Labs `dbt_semantic_view` package) | To confirm |
 | Alerting | dbt Cloud notifications | Task failure notifications; Snowflake alerts on run-control views | To confirm |
 | Continuous data quality monitoring | (partner tools) | Snowflake data metric functions on published outputs (history restarts per publication, Section 9.4) | To confirm |
-| PII protection | (none built in) | Classification tags carried onto every derived published column; tag-based masking policies | Documented (mechanism); Design (tag carry-over) |
+| PII protection | (none built in) | Classification tags that propagate through views and tables (`PROPAGATE = ON_DEPENDENCY_AND_DATA_MOVEMENT`), tag-based masking policies, and a reserved tag value for declassification (SLD Section 5.3) | Documented |
 | Cost attribution | (none built in) | Warehouse per Tier or unit, query and object tags, resource monitors | Design |
 
 One dbt Mesh capability has no Snowflake equivalent today: **compile-time validation of references across projects**. It is mitigated by contracts, the generated source package and versioning (Section 6.4).
@@ -510,9 +508,9 @@ One dbt Mesh capability has no Snowflake equivalent today: **compile-time valida
 | **dbt-loom** (open-source cross-project `ref` from upstream manifests) | Requires a Python plugin installed into the dbt runtime, which Snowflake's managed runtime does not allow |
 | **Snowflake's native cross-project dependency** (copy the referenced project into the consumer) | A package-with-models approach; rejected for the reasons in Section 6.3 |
 | **End-to-end projects, each with its own staging layer** | The conventional single-project layout. Rejected because every team would rebuild the same sourcing and shaping, with divergent results, and none would get the Silver guarantees in Section 3.2 |
-| **dbt Fusion runtime from the start** | Faster parsing and strict static analysis, generally available on Snowflake. Deferred until its stability and the migration path for this design's custom macros are confirmed (spike S13) |
+| **dbt Fusion runtime from the start** | Faster parsing and strict static analysis, generally available on Snowflake. Deferred until its stability and the migration path for this design's custom macros are confirmed (spike S13, not yet run). The custom macros and the freeze `run-operation` are Core-specific, so this is a precondition of any move |
 
-Alternatives for the Silver Layer's internal mechanisms are recorded in SLD Section 15.
+Alternatives for the Silver Layer's internal mechanisms are recorded in SLD Appendix B.
 
 ---
 
